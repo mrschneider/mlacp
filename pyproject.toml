@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlacp"
+version = "0.1.0"
+description = "Multi-Layered Agentic Communication Protocol — agent-to-agent layers ported from reference architectures of the Soviet/Russian communications tradition"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Guilherme Schneider" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications",
+    "Topic :: Security :: Cryptographic",
+]
+
+[tool.setuptools.packages.find]
+include = ["mlacp_core*", "mlacp_engine*"]
