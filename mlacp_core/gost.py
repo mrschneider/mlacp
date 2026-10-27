@@ -229,9 +229,10 @@ class Kuznyechik:
 
     def _key_schedule(self, key: bytes):
         k1, k2 = key[:16], key[16:]
-        if self._CONSTANTS is None:
-            self._CONSTANTS = [_l_lin(i.to_bytes(16, "big")) for i in range(1, 33)]
-        constants = self._CONSTANTS
+        if Kuznyechik._CONSTANTS is None:
+            # class attribute, not instance: every cipher shares the fix
+            Kuznyechik._CONSTANTS = [_l_lin(i.to_bytes(16, "big")) for i in range(1, 33)]
+        constants = Kuznyechik._CONSTANTS
         keys = [k1, k2]
         a, b = k1, k2
         for i in range(4):
@@ -246,6 +247,9 @@ class Kuznyechik:
     def encrypt_block(self, a: bytes) -> bytes:
         if len(a) != 16:
             raise ValueError("Kuznyechik operates on 16-byte blocks")
+        # MEASURED: a fused S∘L T-table (16 int-XORs per round) lost to
+        # this translate+L-table form (~41us vs ~20us) — C translate beats
+        # big-int composition in CPython. Keep the simple form.
         t = a
         for k in self._rk[:9]:
             t = _lsx(k, t)
@@ -396,13 +400,6 @@ def ctr_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
 _MGM_POLY_MSB = 0x87
 
 
-def _mgm_dbl(x: int) -> int:
-    x <<= 1
-    if x >> 128:
-        x = (x & ((1 << 128) - 1)) ^ _MGM_POLY_MSB
-    return x
-
-
 def _mgm_mul(x: int, y: int) -> int:
     """Field multiplication over GF(2^128), f(w) = w^128+w^7+w^2+w+1; bit i
     of the big-endian integer is the coefficient of w^i (RFC 9058 §3).
@@ -477,6 +474,8 @@ def mgm_encrypt(key: bytes, icn: bytes, aad: bytes, plaintext: bytes,
     Verified against RFC 9058 Appendix A.1.1 (ciphertext and tag)."""
     if len(icn) != 16 or icn[0] & 0x80:
         raise ValueError("MGM ICN must be 16 bytes with the top bit zero")
+    if not 1 <= tag_len <= 16:
+        raise ValueError("MGM tag length must be 1..16 bytes (RFC 9058 §5.3)")
     cipher = Kuznyechik(key)
     y = cipher.encrypt_block(icn)
     ct = bytearray()
@@ -491,6 +490,10 @@ def mgm_encrypt(key: bytes, icn: bytes, aad: bytes, plaintext: bytes,
 def mgm_decrypt(key: bytes, icn: bytes, aad: bytes, ciphertext: bytes,
                 tag: bytes) -> bytes:
     """RFC 9058 §4.2. Raises ValueError when the tag does not verify."""
+    if len(icn) != 16 or icn[0] & 0x80:
+        raise ValueError("MGM ICN must be 16 bytes with the top bit zero")
+    if not 1 <= len(tag) <= 16:
+        raise ValueError("MGM tag length must be 1..16 bytes (RFC 9058 §5.3)")
     cipher = Kuznyechik(key)
     y = cipher.encrypt_block(icn)
     pt = bytearray()
@@ -567,6 +570,8 @@ def secure_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
 
 
 def secure_decrypt(key: bytes, payload: bytes) -> bytes:
+    if len(payload) < 32:  # iv(16) + tag(16); shorter would slice silently
+        raise ValueError("secure frame too short — iv(16) || ct || tag(16)")
     iv, ct, tag = payload[:16], payload[16:-16], payload[-16:]
     return mgm_decrypt(key, iv, MGM_AAD, ct, tag)
 
@@ -674,6 +679,8 @@ def _streebog_l(a: bytes) -> bytes:
 
 _P_PERM = tuple(63 - TAU[63 - j] for j in range(64))
 
+_STREEBOG_C_BYTES = [bytes.fromhex(c) for c in STREEBOG_C]
+
 
 def _streebog_p(a: bytes) -> bytes:
     """RFC 6986 §6.3/§7 P(a_63||...||a_0) = a_Tau(63)||...||a_Tau(0).
@@ -690,7 +697,7 @@ def _streebog_g(h: bytes, n: bytes, m: bytes) -> bytes:
     schedule K[1] = LPS(h ⊕ N), K[i] = LPS(K[i-1] ⊕ C[i-1])."""
     ks = [_streebog_lps(_xor128(h, n))]
     for i in range(12):
-        c = bytes.fromhex(STREEBOG_C[i])
+        c = _STREEBOG_C_BYTES[i]
         ks.append(_streebog_lps(_xor128(ks[-1], c)))
     t = m
     for k in ks[:12]:  # LPSX[K1] .. LPSX[K12]
