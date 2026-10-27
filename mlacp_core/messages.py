@@ -28,7 +28,8 @@ PROTOCOL = "mlacp"
 MAJOR, MINOR = 1, 0
 
 WIRE_KINDS = frozenset(
-    {"hello", "envelope", "custody", "custody_ack", "route_update", "error", "close"}
+    {"hello", "envelope", "custody", "custody_ack", "route_update", "error",
+     "close", "handshake"}
 )
 
 MAX_TTL = 16  # hop budget, the field-grid hop discipline

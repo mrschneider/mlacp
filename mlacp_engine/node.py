@@ -60,6 +60,7 @@ class CenterNode:
         self._conns: dict[str, object] = {}       # service urn -> channel-like
         self._contact_fn = None                   # grid hook: (center)->node|None
         self.peers: dict[str, tuple[str, int]] = {}   # center -> (host, port)
+        self._pending_handshake: tuple | None = None
 
     # -- journaling -----------------------------------------------------------
     def _jour(self, event: str, **fields) -> None:
@@ -289,6 +290,61 @@ class CenterNode:
             raise NotPermitted("secure bundle received but this node has no key")
         payload = base64.b64decode(secure_body["payload"])
         return json.loads(secure_decrypt(self.link_key, payload))
+
+    # -- VKO handshake (layer 6 over layer 1) ---------------------------------
+    def initiate_handshake(self, curve=None) -> dict:
+        """Produce the `handshake` OFFER frame: this center generates an
+        ephemeral VKO keypair (ГОСТ Р 34.10-2012) and a random UKM. The peer
+        answers `accept`, and both sides derive the SAME KEK (the agreement
+        is symmetric — proven against RFC 7836 §B), which becomes the link
+        key protecting all subsequent envelope/custody traffic."""
+        from mlacp_core.gost_ec import CURVE_512A, generate_keypair, \
+            point_to_wire
+        import os
+        curve = curve or CURVE_512A
+        d, pub = generate_keypair(curve)
+        ukm = int.from_bytes(os.urandom(8), "little")
+        self._pending_handshake = (curve, d, ukm)
+        return frame("handshake", role="offer", curve=curve.name,
+                     ukm=ukm, **point_to_wire(curve, pub))
+
+    def _on_handshake(self, f, conn) -> dict | None:
+        from mlacp_core.gost_ec import (CURVE_512A, CURVE_256A, generate_keypair,
+                                        point_from_wire, point_to_wire, vko)
+        curves = {c.name: c for c in (CURVE_512A, CURVE_256A)}
+        role = f.get("role")
+        if role not in ("offer", "accept"):
+            raise BusinessRefusal("handshake role must be 'offer' or 'accept'")
+        if role == "accept" and not self._pending_handshake:
+            raise BusinessRefusal("handshake accept without a pending offer")
+        if role == "offer":
+            curve = curves.get(f.get("curve"), CURVE_512A)
+            peer_pub = self._peer_point(curve, f)
+            ukm = int(f.get("ukm", 1))
+            d, pub = generate_keypair(curve)
+            # KEK from OUR ephemeral private key and THEIR public point
+            self.link_key = vko(curve, d, peer_pub, ukm, bits=256)
+            self._jour("handshake_complete", role="acceptor",
+                       curve=curve.name, ukm=ukm)
+            return frame("handshake", role="accept", curve=curve.name,
+                         **point_to_wire(curve, pub))
+        if role == "accept":
+            curve, d, ukm = self._pending_handshake
+            peer_pub = self._peer_point(curve, f)
+            self.link_key = vko(curve, d, peer_pub, ukm, bits=256)
+            self._jour("handshake_complete", role="initiator",
+                       curve=curve.name, ukm=ukm)
+            self._pending_handshake = None
+            return None
+        raise BusinessRefusal("handshake role must be 'offer' or 'accept'")
+
+    @staticmethod
+    def _peer_point(curve, f) -> tuple:
+        from mlacp_core.gost_ec import point_from_wire
+        try:
+            return point_from_wire(curve, f)
+        except ValueError as e:
+            raise BusinessRefusal(str(e)) from e
 
     # -- capability guard ------------------------------------------------------------
     def authorize_or_refuse(self, sender_urn: str, capability: str) -> None:

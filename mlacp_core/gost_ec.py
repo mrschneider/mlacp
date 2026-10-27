@@ -133,6 +133,33 @@ CURVE_512A = _curve_512a()
 CURVE_256A = _curve_256a()
 
 
+def generate_keypair(curve: Curve) -> tuple[int, tuple]:
+    """An ephemeral VKO keypair: (private, public) with the public point on
+    the curve. The private scalar is os.urandom-sourced."""
+    import os
+    while True:
+        d = int.from_bytes(os.urandom(curve.bits // 8), "little")
+        if 0 < d < curve.q:
+            return d, curve.public_key(d)
+
+
+def point_to_wire(curve: Curve, P: tuple) -> dict:
+    """The wire form of a public point: X and Y LITTLE-ENDIAN hex (the ГОСТ
+    wire convention verified against RFC 7836 §B)."""
+    w = curve.bits // 8
+    return {"x": P[0].to_bytes(w, "little").hex(),
+            "y": P[1].to_bytes(w, "little").hex()}
+
+
+def point_from_wire(curve: Curve, wire: dict) -> tuple:
+    w = curve.bits // 8
+    P = (int.from_bytes(bytes.fromhex(wire["x"]), "little"),
+         int.from_bytes(bytes.fromhex(wire["y"]), "little"))
+    if not curve.on_curve(P):
+        raise ValueError("peer public key is not on the curve")
+    return P
+
+
 def vko(curve: Curve, private_key: int, peer_public: tuple, ukm: int = 1,
         bits: int = 256) -> bytes:
     """VKO_GOSTR3410_2012_{256,512} (RFC 7836 §4.3):

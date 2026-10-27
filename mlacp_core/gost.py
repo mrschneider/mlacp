@@ -717,8 +717,9 @@ def ctr_acpkm_encrypt(key: bytes, icn: bytes, plaintext: bytes,
         raise ValueError("section size must be a multiple of the block size")
     blocks_per_section = section_bytes // m
     # D material for re-keying: k bytes = key length worth of D blocks
-    j = len(key) // m
-    d_blocks = [_ACPKM_D[i * m:(i + 1) * m] for i in range(j)]
+    j = -(-len(key) // m)  # ceil: keys not multiple of the block size take
+    d_blocks = [_ACPKM_D[i * m:(i + 1) * m] for i in range(j)]  # MSB_k of the
+    # concatenated D encryptions (ACPKM = MSB_k(E(D_1) || E(D_2) || …))
     out = bytearray()
     ctr = 0
     for section_start in range(0, len(plaintext), section_bytes):
@@ -731,7 +732,7 @@ def ctr_acpkm_encrypt(key: bytes, icn: bytes, plaintext: bytes,
         # refresh the section key for the next section
         if section_start + section_bytes < len(plaintext):
             newkey = b"".join(cipher.encrypt_block(d) for d in d_blocks)
-            cipher = cipher_cls(newkey)
+            cipher = cipher_cls(newkey[:len(key)])  # MSB_k
     return bytes(out)
 
 
@@ -842,3 +843,174 @@ def omac_acpkm_master(key: bytes, data: bytes, tag_len: int = 16,
         blocks = [section[k:k + m] for k in range(0, len(section), m)]
         chained = mac_section(material, blocks, chained, i == len(sections) - 1)
     return chained[:tag_len]
+
+
+# ---------------------------------------------------------------------------
+# GCM-ACPKM / GCM-ACPKM-Master (draft-12 §6.2.3 / §6.3.3)
+# ---------------------------------------------------------------------------
+
+def _pad16(b: bytes) -> bytes:
+    return b + bytes(16 - len(b) % 16) if len(b) % 16 else b
+
+
+_GCM_R = 0xE1 << 120
+
+
+def _gcm_mul(x: int, y: int) -> int:
+    """GCM field multiplication (NIST SP 800-38D convention, "by analogy
+    with [GCM]" per the draft): the LEFTMOST bit of the block is the
+    coefficient of x^0 — the OPPOSITE byte order to MGM's convention.
+    f(w) = w^128 + w^7 + w^2 + w + 1, encoded 0xE1 || 0^120."""
+    z, v = 0, y
+    for i in range(128):
+        if (x >> (127 - i)) & 1:
+            z ^= v
+        v = (v >> 1) ^ _GCM_R if v & 1 else v >> 1
+    return z
+
+
+def _ghash(data_blocks: list[bytes], h_block: bytes) -> bytes:
+    y = 0
+    hv = int.from_bytes(h_block, "big")
+    for b in data_blocks:
+        y = _gcm_mul(y ^ int.from_bytes(b, "big"), hv)
+    return y.to_bytes(16, "big")
+
+
+def _gcm_acpkm_core(key: bytes, icn: bytes, aad: bytes, data: bytes,
+                    cipher_cls, section_bytes: int, c: int, master: bool,
+                    master_chunk_bytes: int | None, encrypt: bool):
+    """Shared GCM-ACPKM/Master engine. Returns (ciphertext, tag); the GHASH
+    ALWAYS runs over the ciphertext (GCTR input on decrypt, output on
+    encrypt)."""
+    cipher = cipher_cls(key)
+    m = cipher.BLOCK
+    if m != 16:
+        raise ValueError("GCM-ACPKM requires a 128-bit block cipher")
+    if len(icn) != m - c // 8:
+        raise ValueError("ICN must be (n - c) bits")
+    if section_bytes % m or (master_chunk_bytes and master_chunk_bytes % len(key)):
+        raise ValueError("bad section/master sizes")
+
+    def acpkm_keys(n_keys: int) -> list[bytes]:
+        """Section keys. Internal mode: K^j = MSB_k(E_{K^{j-1}}(D_1)||…).
+        Master mode: chunks of the ACPKM-Master material (a master-keyed
+        CTR-ACPKM over zeros, re-keying itself every master_chunk_bytes)."""
+        if not master:
+            keys = [key]
+            cur = key
+            for _ in range(n_keys - 1):
+                cc = cipher_cls(cur)
+                material = b"".join(cc.encrypt_block(_ACPKM_D[i * m:(i + 1) * m])
+                                    for i in range(-(-len(cur) // m)))
+                cur = material[:len(key)]
+                keys.append(cur)
+            return keys
+        material = ctr_acpkm_encrypt(
+            key, b"\xff" * (m // 2) + b"\x00" * (m // 2),
+            bytes(n_keys * len(key) + len(key)), cipher_cls, master_chunk_bytes)
+        return [material[i * len(key):(i + 1) * len(key)] for i in range(n_keys)]
+
+    def inc_c(block: bytes) -> bytes:
+        low = (int.from_bytes(block[-c // 8:], "big") + 1) % (1 << c)
+        return block[:-c // 8] + low.to_bytes(c // 8, "big")
+
+    icb0 = icn + b"\x00" * (c // 8 - 1) + b"\x01"
+
+    if master:
+        n_sections = max(1, -(-len(data) // section_bytes))
+        k1 = acpkm_keys(1)[0]
+        keys = acpkm_keys(n_sections)
+    else:
+        k1 = key
+        keys = acpkm_keys(max(1, -(-max(len(data), 1) // section_bytes)))
+
+    h_block = cipher_cls(k1).encrypt_block(bytes(16))
+
+    # GCTR: encrypt in sections, key per section
+    out = bytearray()
+    # GCTR starts at Inc_c(ICB_0) (the ICB_0 block itself is the tag mask)
+    ctr_int = (int.from_bytes(icb0[-c // 8:], "big") + 1) % (1 << c)
+    high = icb0[:-c // 8]
+    for s_off in range(0, max(len(data), 1), section_bytes):
+        sec = data[s_off:s_off + section_bytes]
+        if master:
+            sec_cipher = cipher_cls(keys[s_off // section_bytes])
+        else:
+            sec_cipher = cipher_cls(keys[min(len(keys) - 1,
+                                             s_off // section_bytes)])
+        for off in range(0, len(sec), m):
+            ctr_block = high + ctr_int.to_bytes(c // 8, "big")
+            ks = sec_cipher.encrypt_block(ctr_block)
+            out += bytes(x ^ y for x, y in zip(sec[off:off + m], ks))
+            ctr_int = (ctr_int + 1) % (1 << c)
+    ct = bytes(out)
+
+    lens = ((len(aad) * 8).to_bytes(8, "big") +
+            (len(ct) * 8).to_bytes(8, "big"))
+    pa, pc = _pad16(aad), _pad16(ct if encrypt else data)
+    blocks = ([pa[i:i + m] for i in range(0, len(pa), m)] +
+              [pc[i:i + m] for i in range(0, len(pc), m)] + [lens])
+    s = _ghash(blocks, h_block)
+    tag = bytes(x ^ y for x, y in zip(cipher_cls(k1).encrypt_block(icb0), s))
+    return ct, tag[:16]
+
+
+def gcm_acpkm_encrypt(key: bytes, icn: bytes, aad: bytes, plaintext: bytes,
+                      cipher_cls=None, section_bytes: int = 32, c: int = 32,
+                      tag_len: int = 16) -> tuple[bytes, bytes]:
+    """GCM-ACPKM (draft-12 §6.2.3): GCM with internal ACPKM re-keying of the
+    CTR section keys (H and the ICB_0 mask stay under the INITIAL key).
+    Verified against the draft's official AES-128 test example (N = 256,
+    c = 32)."""
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    ct, tag = _gcm_acpkm_core(key, icn, aad, plaintext, cipher_cls,
+                              section_bytes, c, master=False,
+                              master_chunk_bytes=None, encrypt=True)
+    return ct, tag[:tag_len]
+
+
+def gcm_acpkm_decrypt(key: bytes, icn: bytes, aad: bytes, ciphertext: bytes,
+                      tag: bytes, cipher_cls=None, section_bytes: int = 32,
+                      c: int = 32) -> bytes:
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    ct, computed = _gcm_acpkm_core(key, icn, aad, ciphertext, cipher_cls,
+                                   section_bytes, c, master=False,
+                                   master_chunk_bytes=None, encrypt=False)
+    if computed[:len(tag)] != tag:
+        raise ValueError("GCM-ACPKM tag verification failed")
+    return ct
+
+
+def gcm_acpkm_master_encrypt(key: bytes, icn: bytes, aad: bytes,
+                             plaintext: bytes, cipher_cls=None,
+                             section_bytes: int = 32, c: int = 32,
+                             master_chunk_bytes: int = 48,
+                             tag_len: int = 16) -> tuple[bytes, bytes]:
+    """GCM-ACPKM-Master (draft-12 §6.3.3): section keys drawn from the
+    ACPKM-Master material (a master-keyed CTR-ACPKM over zeros, re-keying
+    itself every T* = ``master_chunk_bytes``); H and the ICB_0 mask are
+    computed under K^1. Verified against the draft's official AES-192 test
+    example (k = 192, T* = 384, N = 256, c = 32)."""
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    ct, tag = _gcm_acpkm_core(key, icn, aad, plaintext, cipher_cls,
+                              section_bytes, c, master=True,
+                              master_chunk_bytes=master_chunk_bytes, encrypt=True)
+    return ct, tag[:tag_len]
+
+
+def gcm_acpkm_master_decrypt(key: bytes, icn: bytes, aad: bytes,
+                             ciphertext: bytes, tag: bytes, cipher_cls=None,
+                             section_bytes: int = 32, c: int = 32,
+                             master_chunk_bytes: int = 48) -> bytes:
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    ct, computed = _gcm_acpkm_core(key, icn, aad, ciphertext, cipher_cls,
+                                   section_bytes, c, master=True,
+                                   master_chunk_bytes=master_chunk_bytes, encrypt=False)
+    if computed[:len(tag)] != tag:
+        raise ValueError("GCM-ACPKM-Master tag verification failed")
+    return ct

@@ -29,16 +29,31 @@ from .grid import CommunicationsGrid, NoRoute  # noqa: F401
 from .gost import (  # noqa: F401
     Kuznyechik,
     Magma,
+    ctr_acpkm_encrypt,
+    ctr_acpkm_master,
     ctr_decrypt,
     ctr_encrypt,
+    gcm_acpkm_decrypt,
+    gcm_acpkm_encrypt,
+    gcm_acpkm_master_decrypt,
+    gcm_acpkm_master_encrypt,
     gost_mac,
     mgm_decrypt,
     mgm_encrypt,
+    omac_acpkm_master,
     secure_decrypt,
     secure_encrypt,
     streebog_256,
     streebog_512,
     streebog_practical,
+)
+from .gost_ec import (  # noqa: F401
+    CURVE_256A,
+    CURVE_512A,
+    generate_keypair,
+    point_from_wire,
+    point_to_wire,
+    vko,
 )
 from .messages import (  # noqa: F401
     MAX_TTL,

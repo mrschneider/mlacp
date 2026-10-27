@@ -25,7 +25,7 @@ refusal is the feature. Every refusal is typed and answered in-protocol.
 
 ## Verified results
 
-- **80 unit tests pass** (`python -m pytest tests/ -q`).
+- **85 unit tests pass** (`python -m pytest tests/ -q`).
 - **Kuznyechik verified against every official example of RFC 7801 §5** —
   substitution, linear transform, key schedule (K1..K10), encryption and
   decryption, byte for byte.
@@ -45,10 +45,17 @@ refusal is the feature. Every refusal is typed and answered in-protocol.
   cofactor-4 twisted Edwards curve in Weierstrass model) verifies:
   generator on curve, q·G = O, order 4·q.
 - **ACPKM key meshing verified against the official test examples of
-  draft-irtf-cfrg-re-keying-12 Appendix A.2** — CTR-ACPKM, CTR-ACPKM-Master
-  and OMAC-ACPKM-Master (AES-256 as the test cipher; the construction is
-  cipher-agnostic and the Kuznyechik/Magma instantiations share the same
-  verified code path).
+  draft-irtf-cfrg-re-keying-12 Appendix A.2** — CTR-ACPKM, CTR-ACPKM-Master,
+  OMAC-ACPKM-Master, **GCM-ACPKM and GCM-ACPKM-Master** (AES as the test
+  cipher; the construction is cipher-agnostic and the Kuznyechik/Magma
+  instantiations share the same verified code path).
+- **VKO handshake over the wire**: the `handshake` frame kind (the closed
+  vocabulary is now eight verbs) lets two centers with NO pre-shared key
+  derive their link key from ephemeral ГОСТ Р 34.10-2012 keys — the offer
+  carries the ephemeral public point (LE) + UKM, the acceptor replies, and
+  both sides hold the identical KEK_256 (symmetry proven on the wire in the
+  test); the derived key immediately protects envelope traffic, and a
+  public point not on the curve is refused in-protocol.
 - **Cross-language E2E**: a Node.js client (`experiments/client.js`) drives
   the Python reference center over TCP through registration, envelope
   ping-pong, custody with dump-on-return, and typed refusals:
@@ -128,14 +135,14 @@ chain.delegate(root, "mlacp:front/west/hq", ["nuclear"])     # DelegationEscalat
   same input, and every consumer must pick one explicitly.
 - **MGM ICN top bit**: reserved per RFC 9058 (V_{n-1}); the node generates
   ICNs accordingly.
-- Envelope bodies on an open wire WITHOUT a `link_key` remain plaintext
-  JSON — encryption requires a shared link key between the centers.
-- The GCM-ACPKM / MGM-ACPKM modes (AEAD over meshed keys) are not
-  implemented; the meshing itself (CTR-ACPKM, CTR-ACPKM-Master,
-  OMAC-ACPKM-Master) is.
-- Inter-center links pre-share the link key; a full VKO handshake over the
-  wire (KEK derivation from ephemeral keys) is future work — the VKO
-  primitive itself is verified.
+- Envelope bodies on an open wire WITHOUT a link key (or before a
+  `handshake`) remain plaintext JSON.
+- MGM-ACPKM is not a standardized mode (the draft defines GCM/CBC/CTR over
+  meshed keys); the MGM path uses single-key AEAD, the meshed AEAD path is
+  GCM-ACPKM(-Master).
+- The handshake derives one static KEK per center pair per session; forward
+  secrecy across re-keying of an ESTABLISHED link (fresh ephemerals per
+  epoch) is future work.
 
 ## Layout
 
