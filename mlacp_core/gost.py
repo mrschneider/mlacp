@@ -100,12 +100,18 @@ def _gf_mul(a: int, b: int) -> int:
     return r
 
 
+# byte-value translation tables for the S-layer: bytes.translate runs the
+# whole substitution in C instead of a per-byte Python loop
+_S_FWD = bytes(PI)
+_S_INV = bytes(PI_INV)
+
+
 def _sub_s(a: bytes) -> bytes:
-    return bytes(PI[b] for b in a)
+    return a.translate(_S_FWD)
 
 
 def _sub_s_inv(a: bytes) -> bytes:
-    return bytes(PI_INV[b] for b in a)
+    return a.translate(_S_INV)
 
 
 def _r_lin(a: bytes) -> bytes:
@@ -113,12 +119,6 @@ def _r_lin(a: bytes) -> bytes:
     for coef, byte in zip(L_COEF, a):
         l ^= _gf_mul(coef, byte)
     return bytes([l]) + a[:15]
-
-
-def _l_lin(a: bytes) -> bytes:
-    for _ in range(16):
-        a = _r_lin(a)
-    return a
 
 
 def _r_inv(a: bytes) -> bytes:
@@ -129,10 +129,63 @@ def _r_inv(a: bytes) -> bytes:
     return a[1:] + bytes([l])
 
 
+# ---------------------------------------------------------------------------
+# Full L / L^-1 as precomputed linear tables. L is GF(2)-linear, so the
+# contribution of input byte i = b is the XOR of the basis contributions of
+# its set bits; we evaluate the 128 basis vectors once and answer every
+# later L-transform with 16 table lookups instead of 256 GF multiplications.
+# ---------------------------------------------------------------------------
+_L_TABS: list | None = None     # forward: [position][byte] -> int (16-byte value)
+_LINV_TABS: list | None = None  # inverse: [position][byte] -> int (16-byte value)
+
+
+def _build_l_tables():
+    global _L_TABS, _LINV_TABS
+    if _L_TABS is None:
+        _L_TABS = [[0] * 256 for _ in range(16)]
+        for i in range(16):
+            for bit in range(8):
+                a = bytearray(16)
+                a[i] = 1 << bit
+                for _ in range(16):
+                    a = _r_lin(a)
+                contrib = int.from_bytes(a, "big")
+                mask = 1 << bit
+                tab = _L_TABS[i]
+                for b in range(256):
+                    if b & mask:
+                        tab[b] ^= contrib
+    if _LINV_TABS is None:
+        _LINV_TABS = [[0] * 256 for _ in range(16)]
+        for i in range(16):
+            for bit in range(8):
+                a = bytearray(16)
+                a[i] = 1 << bit
+                for _ in range(16):
+                    a = _r_inv(a)
+                contrib = int.from_bytes(a, "big")
+                mask = 1 << bit
+                tab = _LINV_TABS[i]
+                for b in range(256):
+                    if b & mask:
+                        tab[b] ^= contrib
+    return _L_TABS, _LINV_TABS
+
+
+def _l_lin(a: bytes) -> bytes:
+    tabs = _L_TABS or _build_l_tables()[0]
+    l = 0
+    for tab, byte in zip(tabs, a):
+        l ^= tab[byte]
+    return l.to_bytes(16, "big")
+
+
 def _l_inv(a: bytes) -> bytes:
-    for _ in range(16):
-        a = _r_inv(a)
-    return a
+    tabs = _LINV_TABS or _build_l_tables()[1]
+    l = 0
+    for tab, byte in zip(tabs, a):
+        l ^= tab[byte]
+    return l.to_bytes(16, "big")
 
 
 def _lsx(k: bytes, a: bytes) -> bytes:
@@ -140,7 +193,16 @@ def _lsx(k: bytes, a: bytes) -> bytes:
 
 
 def _xor128(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, b))
+    # big-int XOR runs in C; the per-byte generator loop was a top cost
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).to_bytes(
+        max(len(a), len(b)), "big"
+    )
+
+
+def _xor_bytes(a: bytes, b: bytes) -> bytes:
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).to_bytes(
+        max(len(a), len(b)), "big"
+    )
 
 
 class Kuznyechik:
@@ -148,14 +210,28 @@ class Kuznyechik:
 
     BLOCK = 16
 
+    # the 32 key-schedule constants are fixed by the standard — computed once
+    _CONSTANTS: list | None = None
+    # round-key schedules are pure functions of the key: cache the last few
+    _RK_CACHE: dict = {}
+
     def __init__(self, key: bytes):
         if len(key) != 32:
             raise ValueError("Kuznyechik key must be 32 bytes (V_256)")
+        cached = self._RK_CACHE.get(key)
+        if cached is not None:
+            self._rk = cached
+            return
         self._rk = self._key_schedule(key)
+        if len(self._RK_CACHE) >= 8:
+            self._RK_CACHE.pop(next(iter(self._RK_CACHE)))
+        self._RK_CACHE[key] = self._rk
 
     def _key_schedule(self, key: bytes):
         k1, k2 = key[:16], key[16:]
-        constants = [_l_lin(i.to_bytes(16, "big")) for i in range(1, 33)]
+        if self._CONSTANTS is None:
+            self._CONSTANTS = [_l_lin(i.to_bytes(16, "big")) for i in range(1, 33)]
+        constants = self._CONSTANTS
         keys = [k1, k2]
         a, b = k1, k2
         for i in range(4):
@@ -208,15 +284,28 @@ MAGMA_S = [
 ]
 
 
+# per-byte-position substitution tables: byte p (0 = MSB) carries two nibbles
+# through boxes K_{2p} and K_{2p+1} (MSB-first nibble i goes through K_{8-i});
+# 4 table lookups replace the per-round 8-iteration nibble loop
+_MAGMA_BTAB = [
+    [
+        (MAGMA_S[(b >> 4) & 0xF][7 - 2 * p] << 4) | MAGMA_S[b & 0xF][7 - (2 * p + 1)]
+        for b in range(256)
+    ]
+    for p in range(4)
+]
+
+
 def _magma_sub(x: int) -> int:
     """Substitute the eight 4-bit nibbles (MSB first) through the param-Z
     boxes: the nibble i positions from the MSB goes through column K_{8-i}.
     Resolved against the official GOST R 34.12-2015 Magma test vector."""
-    out = 0
-    for i in range(8):
-        nib = (x >> (4 * (7 - i))) & 0xF
-        out = (out << 4) | MAGMA_S[nib][7 - i]
-    return out
+    return (
+        (_MAGMA_BTAB[0][(x >> 24) & 0xFF] << 24)
+        | (_MAGMA_BTAB[1][(x >> 16) & 0xFF] << 16)
+        | (_MAGMA_BTAB[2][(x >> 8) & 0xFF] << 8)
+        | _MAGMA_BTAB[3][x & 0xFF]
+    )
 
 
 def _rol32(v: int, n: int) -> int:
@@ -286,7 +375,10 @@ def ctr_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     for off in range(0, len(plaintext), 16):
         ks = cipher.encrypt_block(ctr)
         chunk = plaintext[off:off + 16]
-        out += bytes(x ^ y for x, y in zip(chunk, ks))
+        # CTR consumes the keystream from its START: left-align the partial
+        # chunk so the XOR hits the keystream's high bytes
+        out += ((int.from_bytes(chunk, "big") << (8 * (16 - len(chunk))))
+                ^ int.from_bytes(ks, "big")).to_bytes(16, "big")[: len(chunk)]
         ctr = _inc(ctr)
     return bytes(out)
 
@@ -313,13 +405,31 @@ def _mgm_dbl(x: int) -> int:
 
 def _mgm_mul(x: int, y: int) -> int:
     """Field multiplication over GF(2^128), f(w) = w^128+w^7+w^2+w+1; bit i
-    of the big-endian integer is the coefficient of w^i (RFC 9058 §3)."""
+    of the big-endian integer is the coefficient of w^i (RFC 9058 §3).
+    4-bit window: precompute the 128 powers x·2^j, then consume y nibble by
+    nibble — 128 inline doublings replace 128 doubling function calls."""
+    if y == 0 or x == 0:
+        return 0
+    mask = (1 << 128) - 1
+    pows = [0] * 128
+    p = x
+    for j in range(128):
+        pows[j] = p
+        p <<= 1
+        if p >> 128:
+            p = (p & mask) ^ _MGM_POLY_MSB
     r = 0
-    a = x
-    for i in range(128):
-        if (y >> i) & 1:
-            r ^= a
-        a = _mgm_dbl(a)
+    for k in range(0, 128, 4):
+        nib = (y >> k) & 0xF
+        if nib:
+            if nib & 1:
+                r ^= pows[k]
+            if nib & 2:
+                r ^= pows[k + 1]
+            if nib & 4:
+                r ^= pows[k + 2]
+            if nib & 8:
+                r ^= pows[k + 3]
     return r
 
 
@@ -372,7 +482,8 @@ def mgm_encrypt(key: bytes, icn: bytes, aad: bytes, plaintext: bytes,
     ct = bytearray()
     for block in _blocks(plaintext):
         ks = cipher.encrypt_block(y)
-        ct += bytes(x ^ k for x, k in zip(block, ks))
+        ct += ((int.from_bytes(block, "big") << (8 * (16 - len(block))))
+               ^ int.from_bytes(ks, "big")).to_bytes(16, "big")[: len(block)]
         y = _incr_r(y)
     return bytes(ct), _mgm_tag(cipher, icn, aad, bytes(ct), tag_len)
 
@@ -385,7 +496,8 @@ def mgm_decrypt(key: bytes, icn: bytes, aad: bytes, ciphertext: bytes,
     pt = bytearray()
     for block in _blocks(ciphertext):
         ks = cipher.encrypt_block(y)
-        pt += bytes(x ^ k for x, k in zip(block, ks))
+        pt += ((int.from_bytes(block, "big") << (8 * (16 - len(block))))
+               ^ int.from_bytes(ks, "big")).to_bytes(16, "big")[: len(block)]
         y = _incr_r(y)
     if _mgm_tag(cipher, icn, aad, ciphertext, len(tag)) != tag:
         raise ValueError("MGM tag verification failed — frame altered in transit")
@@ -421,7 +533,7 @@ def gost_mac(key: bytes, data: bytes, cipher_cls=Kuznyechik,
     k2 = dbl(k1)
 
     def xor(a: bytes, b: bytes) -> bytes:
-        return bytes(x ^ y for x, y in zip(a, b))
+        return _xor_bytes(a, b)
 
     if not data:
         blocks = [bytes(m)]
@@ -527,10 +639,13 @@ STREEBOG_L_ROWS = [
 def _streebog_l64(group: bytes) -> bytes:
     """l: V_64 -> V_64 by RIGHT multiplication with the §6.4 matrix
     (out = v · A, i.e. output bit j sums column j). Input and output are
-    8-byte big-endian vectors (bit 0 = rightmost)."""
+    8-byte big-endian vectors (bit 0 = rightmost). NOTE: measured — the
+    plain bin().count() parity beat a precomputed 16-bit parity table
+    (big-int chunking allocations dominate), so it stays."""
     v = int.from_bytes(group, "big")
+    cols = _streebog_l_cols()
     out = 0
-    for col in _streebog_l_cols():
+    for col in cols:
         out = (out << 1) | (bin(v & col).count("1") & 1)
     return out.to_bytes(8, "big")
 
@@ -557,10 +672,13 @@ def _streebog_l(a: bytes) -> bytes:
     return b"".join(_streebog_l64(a[i:i + 8]) for i in range(0, 64, 8))
 
 
+_P_PERM = tuple(63 - TAU[63 - j] for j in range(64))
+
+
 def _streebog_p(a: bytes) -> bytes:
     """RFC 6986 §6.3/§7 P(a_63||...||a_0) = a_Tau(63)||...||a_Tau(0).
     Components enumerate from the RIGHT: a_k = byte[63-k]."""
-    return bytes(a[63 - TAU[63 - j]] for j in range(64))
+    return bytes(map(a.__getitem__, _P_PERM))
 
 
 def _streebog_lps(a: bytes) -> bytes:
@@ -811,7 +929,7 @@ def omac_acpkm_master(key: bytes, data: bytes, tag_len: int = 16,
         return v.to_bytes(m, "big")
 
     def xor(a: bytes, b: bytes) -> bytes:
-        return bytes(x ^ y for x, y in zip(a, b))
+        return _xor_bytes(a, b)
 
     def mac_section(key_material: bytes, blocks: list[bytes],
                     chained: bytes, last: bool) -> bytes:

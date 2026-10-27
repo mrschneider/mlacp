@@ -66,6 +66,8 @@ class CenterNode:
         self._contact_fn = None                   # grid hook: (center)->node|None
         self.peers: dict[str, tuple[str, int]] = {}   # center -> (host, port)
         self._pending_handshake: tuple | None = None
+        # dispatch table built once — no getattr() reflection per frame
+        self._handlers = {k: getattr(self, f"_on_{k}") for k in WIRE_KINDS}
 
     @property
     def link_key(self) -> bytes | None:
@@ -83,7 +85,7 @@ class CenterNode:
         None). Every refusal is answered IN-PROTOCOL with an error frame."""
         try:
             kind, f = parse_frame(raw)
-            handler = getattr(self, f"_on_{kind}")
+            handler = self._handlers[kind]
             return handler(f, conn)
         except UnknownService as e:
             return self._error("unknown_service", str(e), retryable=False)
