@@ -1,5 +1,10 @@
 # MLACP — Multi-Layered Agentic Communication Protocol
 
+[![CI](https://github.com/mrschneider/mlacp/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/mlacp/actions/workflows/ci.yml)
+[![Release](https://github.com/mrschneider/mlacp/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/mlacp/actions/workflows/release.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 An agent-to-agent communication protocol whose layers are **ported from
 reference architectures of the Soviet / Russian communications tradition** —
 national network doctrines, military store-and-dump relaying, field
