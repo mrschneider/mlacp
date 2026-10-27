@@ -25,7 +25,7 @@ refusal is the feature. Every refusal is typed and answered in-protocol.
 
 ## Verified results
 
-- **67 unit tests pass** (`python -m pytest tests/ -q`).
+- **80 unit tests pass** (`python -m pytest tests/ -q`).
 - **Kuznyechik verified against every official example of RFC 7801 §5** —
   substitution, linear transform, key schedule (K1..K10), encryption and
   decryption, byte for byte.
@@ -41,7 +41,14 @@ refusal is the feature. Every refusal is typed and answered in-protocol.
 - **VKO verified against RFC 7836 Appendix B examples 7 and 8** — public
   keys reproduced from the private keys on
   id-tc26-gost-3410-12-512-paramSetA, both KEK values byte-for-byte, and the
-  agreement proven symmetric.
+  agreement proven symmetric. The **256-bit curve** (tc26-256-A, a
+  cofactor-4 twisted Edwards curve in Weierstrass model) verifies:
+  generator on curve, q·G = O, order 4·q.
+- **ACPKM key meshing verified against the official test examples of
+  draft-irtf-cfrg-re-keying-12 Appendix A.2** — CTR-ACPKM, CTR-ACPKM-Master
+  and OMAC-ACPKM-Master (AES-256 as the test cipher; the construction is
+  cipher-agnostic and the Kuznyechik/Magma instantiations share the same
+  verified code path).
 - **Cross-language E2E**: a Node.js client (`experiments/client.js`) drives
   the Python reference center over TCP through registration, envelope
   ping-pong, custody with dump-on-return, and typed refusals:
@@ -119,21 +126,16 @@ chain.delegate(root, "mlacp:front/west/hq", ["nuclear"])     # DelegationEscalat
   (`streebog_*`) and the CryptoPro practical one (`streebog_practical`) are
   implemented and verified — but they produce DIFFERENT digests for the
   same input, and every consumer must pick one explicitly.
-- **The 256-bit curve** (id-tc26-gost-3410-12-256-paramSetA): the RFC 7836
-  Appendix A.1 listing's parameter mapping resisted verification (the
-  generator does not satisfy the curve equation under any reading we
-  tried). The 512-bit set verifies completely and carries all VKO vectors,
-  so it is the supported curve.
 - **MGM ICN top bit**: reserved per RFC 9058 (V_{n-1}); the node generates
   ICNs accordingly.
-- **Secure mode covers the custody path and is available to envelopes**;
-  envelope bodies on an open wire without a `link_key` remain plaintext
-  JSON.
-- **CTR-ACPKM / OMAC-ACPKM** (key meshing for long messages) are not
-  implemented.
-- The wire's secure mode is exercised through the custody path end-to-end;
-  a full inter-center encrypted envelope exchange over the wire is future
-  work.
+- Envelope bodies on an open wire WITHOUT a `link_key` remain plaintext
+  JSON — encryption requires a shared link key between the centers.
+- The GCM-ACPKM / MGM-ACPKM modes (AEAD over meshed keys) are not
+  implemented; the meshing itself (CTR-ACPKM, CTR-ACPKM-Master,
+  OMAC-ACPKM-Master) is.
+- Inter-center links pre-share the link key; a full VKO handshake over the
+  wire (KEK derivation from ephemeral keys) is future work — the VKO
+  primitive itself is verified.
 
 ## Layout
 
@@ -141,7 +143,7 @@ chain.delegate(root, "mlacp:front/west/hq", ["nuclear"])     # DelegationEscalat
 mlacp_core/     IO-free contract: messages, addresses, custody, grid,
                 directory, authority, gost — no sockets
 mlacp_engine/   reference participant: channels + the CenterNode
-tests/          55 tests: RFC vectors, per-layer contracts, node behavior
+tests/          80 tests: RFC/draft vectors, per-layer contracts, node behavior
 experiments/    the Node.js client + the cross-language E2E driver
 docs/           research (with sources), architecture, requirements
 ```

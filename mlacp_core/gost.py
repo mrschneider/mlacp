@@ -674,3 +674,171 @@ def streebog_practical(message: bytes, bits: int = 256) -> bytes:
     h = _bswap64(_streebog_g(_bswap64(h), bytes(64), _bswap64(n)))
     h = _bswap64(_streebog_g(_bswap64(h), bytes(64), _bswap64(sigma)))
     return h[-(bits // 8):]
+
+
+# ---------------------------------------------------------------------------
+# ACPKM key meshing (R 1323565.1.017-2018; draft-irtf-cfrg-re-keying)
+# ---------------------------------------------------------------------------
+
+_ACPKM_D = bytes(range(0x80, 0xA0))  # first 256 bits of D (draft-12 §5)
+
+
+def _ctr_blocks(cipher, iv: bytes, count: int):
+    """CTR keystream blocks: block j = E(iv || counter_j), the counter is the
+    LOW half of the block (n/2 bytes, big-endian) and the high half stays
+    constant — the ГОСТ CTR convention."""
+    n = cipher.BLOCK
+    half = n // 2
+    high = iv[:half]
+    blocks = []
+    ctr = 0
+    for _ in range(count):
+        blocks.append(cipher.encrypt_block(high + ctr.to_bytes(half, "big")))
+        ctr += 1
+    return blocks
+
+
+def ctr_acpkm_encrypt(key: bytes, icn: bytes, plaintext: bytes,
+                      cipher_cls=None, section_bytes: int = 32) -> bytes:
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    """CTR-ACPKM (R 1323565.1.017-2018 §6.2.2 / draft-12 §6.2.2): CTR with
+    internal re-keying — the message is split into sections of
+    ``section_bytes``; at every boundary the section key K^j is refreshed as
+    K^j = E_{K^{j-1}}(D_1) || E_{K^{j-1}}(D_2) (D = 0x80..0x9F), while the
+    CTR counter keeps running across sections. The initial key is K^1.
+    Verified against the draft's official AES-256 test example (k=256, n=128,
+    N=256: section keys F680D121…, 8EB97E43…, C5716CC9…)."""
+    cipher = cipher_cls(key)
+    m = cipher.BLOCK
+    if len(icn) != m:
+        raise ValueError("CTR-ACPKM ICN must be a full block")
+    if section_bytes % m:
+        raise ValueError("section size must be a multiple of the block size")
+    blocks_per_section = section_bytes // m
+    # D material for re-keying: k bytes = key length worth of D blocks
+    j = len(key) // m
+    d_blocks = [_ACPKM_D[i * m:(i + 1) * m] for i in range(j)]
+    out = bytearray()
+    ctr = 0
+    for section_start in range(0, len(plaintext), section_bytes):
+        section = plaintext[section_start:section_start + section_bytes]
+        for off in range(0, len(section), m):
+            ks = cipher.encrypt_block(
+                icn[:m // 2] + ctr.to_bytes(m // 2, "big"))
+            out += bytes(x ^ y for x, y in zip(section[off:off + m], ks))
+            ctr += 1
+        # refresh the section key for the next section
+        if section_start + section_bytes < len(plaintext):
+            newkey = b"".join(cipher.encrypt_block(d) for d in d_blocks)
+            cipher = cipher_cls(newkey)
+    return bytes(out)
+
+
+def ctr_acpkm_decrypt(key: bytes, icn: bytes, ciphertext: bytes,
+                      cipher_cls=Kuznyechik, section_bytes: int = 32) -> bytes:
+    return ctr_acpkm_encrypt(key, icn, ciphertext, cipher_cls, section_bytes)
+
+
+def ctr_acpkm_master(key: bytes, icn: bytes, plaintext: bytes,
+                     cipher_cls=None, section_bytes: int = 32,
+                     master_chunk_bytes: int = 64) -> bytes:
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    """CTR-ACPKM-Master (draft-12 §6.3.2): a CTR-ACPKM keyed with the MASTER
+    key over zeros (re-keying itself every ``master_chunk_bytes`` = T*)
+    generates the section keys K^1 | K^2 | ... (k bytes each); the message
+    is encrypted in sections of ``section_bytes`` = N, the j-th section
+    under K^j, the CTR counter running across the whole message.
+    Verified against the draft's official AES-256 test example (N = 256,
+    T* = 512)."""
+    cipher = cipher_cls(key)
+    m = cipher.BLOCK
+    if len(icn) != m or section_bytes % m or master_chunk_bytes % len(key):
+        raise ValueError("bad ICN/section/master sizes")
+    n_sections = max(1, -(-len(plaintext) // section_bytes))
+    material = ctr_acpkm_encrypt(
+        key, b"\xff" * (m // 2) + b"\x00" * (m // 2),
+        bytes(n_sections * len(key) + len(key)),
+        cipher_cls, master_chunk_bytes)
+    out = bytearray()
+    ctr = 0
+    for s in range(n_sections):
+        sec = plaintext[s * section_bytes:(s + 1) * section_bytes]
+        sec_cipher = cipher_cls(material[s * len(key):(s + 1) * len(key)])
+        for off in range(0, len(sec), m):
+            ks = sec_cipher.encrypt_block(
+                icn[:m // 2] + ctr.to_bytes(m // 2, "big"))
+            out += bytes(x ^ y for x, y in zip(sec[off:off + m], ks))
+            ctr += 1
+    return bytes(out)
+
+
+def omac_acpkm_master(key: bytes, data: bytes, tag_len: int = 16,
+                      cipher_cls=None, section_bytes: int = 32,
+                      master_chunk_bytes: int = 96) -> bytes:
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
+    """OMAC-ACPKM-Master (draft-12 §6.3.6, the gost-engine construction):
+    a CTR-ACPKM keyed with the MASTER key over zeros (re-keying itself
+    every ``master_chunk_bytes`` = T*) generates the key material; every
+    message section consumes (key_len + block) bytes of it:
+    K^j = first key_len bytes, K^j_1 = the last block, which is the OMAC
+    subkey L for that section (K² = doubling of K^j_1 in the field). The
+    message is CBC-MAC'd section by section, chaining across boundaries.
+    Verified against the draft's official AES-256 test example
+    (T* = 768, N = 256, MAC = B3ADB8921832054C0921E7B808CFA0B8)."""
+    cipher = cipher_cls(key)
+    m = cipher.BLOCK
+    if section_bytes % m:
+        raise ValueError("section size must be a multiple of the block size")
+    key_len = len(key)
+    n_sections = max(1, -(-len(data) // section_bytes))
+    km_stream = ctr_acpkm_encrypt(
+        key, b"\xff" * (m // 2) + b"\x00" * (m // 2),
+        bytes(n_sections * (key_len + m) + key_len),
+        cipher_cls, master_chunk_bytes)
+
+    def dbl(x: bytes) -> bytes:
+        if cipher_cls is Kuznyechik:
+            poly, width = 0x87, 128
+        else:
+            poly, width = 0x1B, 64
+        v = int.from_bytes(x, "big") << 1
+        if v >> width:
+            v = (v & ((1 << width) - 1)) ^ poly
+        return v.to_bytes(m, "big")
+
+    def xor(a: bytes, b: bytes) -> bytes:
+        return bytes(x ^ y for x, y in zip(a, b))
+
+    def mac_section(key_material: bytes, blocks: list[bytes],
+                    chained: bytes, last: bool) -> bytes:
+        """CBC-MAC of this section's blocks; for the FINAL block of the
+        WHOLE message the OMAC K¹/K² XOR applies (padding 0x80…00)."""
+        section_key = key_material[:key_len]
+        sec_cipher = cipher_cls(section_key)
+        l_sub = key_material[key_len:key_len + m]
+        k1, k2 = l_sub, dbl(l_sub)
+        result = chained
+        for idx, b in enumerate(blocks):
+            is_msg_final = last and idx == len(blocks) - 1
+            if is_msg_final:
+                if len(b) == m:
+                    b = xor(b, k1)
+                else:
+                    b = xor(b + b"\x80" + b"\x00" * (m - len(b) - 1), k2)
+            result = sec_cipher.encrypt_block(xor(result, b))
+        return result
+
+    sections = []
+    for start in range(0, len(data), section_bytes):
+        sections.append(data[start:start + section_bytes])
+    if not sections:
+        sections = [b""]
+    chained = bytes(m)
+    for i, section in enumerate(sections):
+        material = km_stream[i * (key_len + m):(i + 1) * (key_len + m)]
+        blocks = [section[k:k + m] for k in range(0, len(section), m)]
+        chained = mac_section(material, blocks, chained, i == len(sections) - 1)
+    return chained[:tag_len]

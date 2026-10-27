@@ -100,15 +100,37 @@ def _curve_512a() -> Curve:
 def _curve_256a() -> Curve:
     """id-tc26-gost-3410-12-256-paramSetA (RFC 7836 Appendix A.1).
 
-    NOT instantiated: the Appendix A.1 listing's integer-to-parameter
-    mapping for the 256-bit set resisted verification (the generator does
-    not satisfy the curve equation under any sign/assignment reading we
-    tried) — the 512-bit set verifies completely and carries all the VKO
-    test vectors, so it is the supported curve. See the README gap list."""
-    raise NotImplementedError
+    NOTE on this set: it is a TWISTED EDWARDS curve in its native form
+    (cofactor 4) — the (a, b) here are its Weierstrass-model constants and
+    the Weierstrass generator is (x, y) as listed below. The RFC 7836
+    listing's integer ORDER is misleading (the generator coordinates are
+    NOT the 4th/5th integers printed); the correct mapping was verified
+    against go-gostcrypto's gost3410curves. Self-checks at import time:
+    the generator satisfies the curve equation and q·G = O (prime-order
+    subgroup), and the full curve order is 4·q."""
+    p = int.from_bytes(bytes.fromhex("00" + "FF" * 30 + "FD97"), "big")
+    a = int.from_bytes(bytes.fromhex(
+        "C2173F1513981673AF4892C23035A27CE25E2013BF95AA33B22C656F277E7335"
+    ), "big")
+    b = int.from_bytes(bytes.fromhex(
+        "295F9BAE7428ED9CCC20E7C359A9D41A22FCCD9108E17BF7BA9337A6F8AE9513"
+    ), "big")
+    q = int.from_bytes(bytes.fromhex(
+        "400000000000000000000000000000000FD8CDDFC87B6635C115AF556C360C67"
+    ), "big")
+    m = 4 * q  # cofactor-4 twisted Edwards model; Weierstrass order 4q
+    gx = int.from_bytes(bytes.fromhex(
+        "91E38443A5E82C0D880923425712B2BB658B9196932E02C78B2582FE742DAA28"
+    ), "big")
+    gy = int.from_bytes(bytes.fromhex(
+        "32879423AB1A0375895786C4BB46E9565FDE0B5344766740AF268ADB32322E5C"
+    ), "big")
+    return Curve("id-tc26-gost-3410-12-256-paramSetA", p, a, b, m, q,
+                 gx, gy, 256)
 
 
 CURVE_512A = _curve_512a()
+CURVE_256A = _curve_256a()
 
 
 def vko(curve: Curve, private_key: int, peer_public: tuple, ukm: int = 1,

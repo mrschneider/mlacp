@@ -115,6 +115,13 @@ class CenterNode:
     # -- envelope: the routed message ---------------------------------------------
     def _on_envelope(self, f, conn) -> dict | None:
         env = Envelope.from_value(f)
+        # layer 6: a wire envelope arriving over an inter-center link is
+        # encrypted with the shared link key — open it BEFORE anything else
+        # (delivery, custody, routing all see the plaintext body)
+        if env.body.get("__secure__"):
+            env = Envelope(sender=env.sender, recipient=env.recipient,
+                           seq=env.seq, ttl=env.ttl,
+                           body=self._unsecure_body(env.body))
         sender = Address.parse(env.sender)
         recipient = Address.parse(env.recipient)
 
@@ -175,8 +182,12 @@ class CenterNode:
         # every relay owns the bundle until the next hop acknowledges.
         if env.ttl - 1 <= 0:
             raise BusinessRefusal(f"hops exhausted before reaching {recipient}")
+        # layer 6: with a shared link key the inter-center body travels
+        # ENCRYPTED over the primary network (MGM secure frame)
         forwarded = frame("envelope", via="center",
-                          **{**env.to_value(), "ttl": env.ttl - 1})
+                          **{**env.to_value(),
+                             "ttl": env.ttl - 1,
+                             "body": self._secure_body(env)})
         reply = self._forward_to_center(hop, forwarded)
         return reply
 
