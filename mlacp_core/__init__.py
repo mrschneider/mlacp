@@ -28,11 +28,17 @@ from .errors import (  # noqa: F401
 from .grid import CommunicationsGrid, NoRoute  # noqa: F401
 from .gost import (  # noqa: F401
     Kuznyechik,
-    cbc_mac,
+    Magma,
     ctr_decrypt,
     ctr_encrypt,
+    gost_mac,
+    mgm_decrypt,
+    mgm_encrypt,
     secure_decrypt,
     secure_encrypt,
+    streebog_256,
+    streebog_512,
+    streebog_practical,
 )
 from .messages import (  # noqa: F401
     MAX_TTL,

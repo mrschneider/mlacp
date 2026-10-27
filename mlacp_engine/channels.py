@@ -88,6 +88,68 @@ class TcpChannel:
             pass
 
 
+class UnixChannel:
+    """A UDS connection wrapped in the Channel interface."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+
+    def send(self, data: bytes) -> None:
+        self.sock.sendall(data)
+
+    def recv(self, timeout: float | None = None) -> bytes | None:
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        try:
+            data = self.sock.recv(65536)
+        except (socket.timeout, TimeoutError):
+            return None
+        return data or None
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class UnixListener:
+    """Binds a unix socket path and yields UnixChannel connections."""
+
+    def __init__(self, path: str, backlog: int = 16):
+        import os
+        self.path = path
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(path)
+        self.sock.listen(backlog)
+
+    def accept(self, timeout: float | None = None) -> UnixChannel | None:
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        try:
+            conn, _ = self.sock.accept()
+        except (socket.timeout, TimeoutError):
+            return None
+        return UnixChannel(conn)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def unix_client(path: str) -> UnixChannel:
+    """Connect to a UDS listening center."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    return UnixChannel(sock)
+
+
 class TcpListener:
     """Binds a port and yields TcpChannel connections (the center's access
     point on the primary network)."""

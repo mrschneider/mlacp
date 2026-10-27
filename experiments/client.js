@@ -80,6 +80,19 @@ async function main() {
     // acknowledge: release custody
     cb.send({ kind: "custody_ack", v: "1.0", bundle_id: `bndl-${A}-1`, status: "released" });
     cb.close();
+  } else if (scenario === "federate") {
+    // arg: the local center urn; B (the peer-homed service) is passed as args[1]
+    const localUrn = arg;
+    const peerSvc = process.argv[5];
+    const ca = connect(port);
+    ca.send(hello(A));
+    const ra = await ca.recv();
+    ok("federate: bound at the local center", ra.kind === "hello");
+    ca.send(envelope(A, peerSvc, 1, { text: "cross-center hello" }));
+    const ack = await ca.recv();
+    ok("federate: hop answered with a custody_ack",
+       ack.kind === "custody_ack" && (ack.status === "delivered" || ack.status === "held"));
+    ca.close();
   } else if (scenario === "refusals") {
     const c = connect(port);
     c.send(hello(A)); await c.recv();

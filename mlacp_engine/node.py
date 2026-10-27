@@ -37,6 +37,7 @@ from mlacp_core.messages import (
     frame,
     parse_frame,
 )
+from mlacp_engine.channels import TcpChannel
 
 
 class CenterNode:
@@ -58,6 +59,7 @@ class CenterNode:
         self._lock = threading.Lock()
         self._conns: dict[str, object] = {}       # service urn -> channel-like
         self._contact_fn = None                   # grid hook: (center)->node|None
+        self.peers: dict[str, tuple[str, int]] = {}   # center -> (host, port)
 
     # -- journaling -----------------------------------------------------------
     def _jour(self, event: str, **fields) -> None:
@@ -125,11 +127,16 @@ class CenterNode:
         # layer 4: mandatory registration + per-org accounting
         self.directory.account(sender.org)
 
-        # layer 4: mandatory registration — an unregistered addressee is
+        # layer 4: mandatory registration — an unregistered LOCAL addressee is
         # refused BY NAME (the OGAS rule: no service outside the directory).
-        # This check runs BEFORE custody: the relay is for registered
-        # services whose center is merely unreachable, not for unknown ones.
-        self.directory.resolve(recipient.to_urn())
+        # Each center's directory covers its OWN services; a service homed on
+        # another center is that center's responsibility (§grid doctrine).
+        if recipient.node == self.urn.node:
+            self.directory.resolve(recipient.to_urn())
+        elif recipient.node not in self.grid.centers():
+            # nobody on this grid has ever heard of the recipient's center:
+            # refusing by name beats forwarding into the void
+            raise UnknownService(recipient.to_urn())
 
         # layer 3: route through the grid toward the recipient's center
         hop = self._route_toward(recipient)
@@ -141,6 +148,11 @@ class CenterNode:
             _chan_send(chan, out)
             self._jour("delivered", sender=env.sender, recipient=env.recipient,
                        seq=env.seq)
+            if f.get("via") == "center":
+                # hop-by-hop custody transfer: the forwarding center owns the
+                # bundle until THIS center acknowledges
+                return frame("custody_ack", bundle_id=f"hop-{env.sender}-{env.seq}",
+                             status="delivered")
             return None
         if hop is None:
             # the recipient's center is unreachable NOW -> layer 2: custody
@@ -157,14 +169,34 @@ class CenterNode:
                        addressee=env.recipient)
             return frame("custody_ack", bundle_id=bundle.bundle_id,
                          status="held")
-        # multi-hop: hand the envelope to the next center's node
-        next_node = self._contact(hop)
-        if next_node is None:
-            raise InfrastructureFailure("unavailable", f"center '{hop}' silent", True)
-        reply = next_node.handle_frame(
-            frame("envelope", **{**env.to_value(), "ttl": env.ttl - 1}), conn)
+        # multi-hop: hand the envelope to the next center's node over the
+        # primary network (layer 1). The peer answers custody_ack (status
+        # held|delivered) — hop-by-hop custody transfer, the Strela rule:
+        # every relay owns the bundle until the next hop acknowledges.
         if env.ttl - 1 <= 0:
             raise BusinessRefusal(f"hops exhausted before reaching {recipient}")
+        forwarded = frame("envelope", via="center",
+                          **{**env.to_value(), "ttl": env.ttl - 1})
+        reply = self._forward_to_center(hop, forwarded)
+        return reply
+
+    def _forward_to_center(self, center: str, forwarded: dict) -> dict:
+        import socket as _socket
+        if center not in self.peers:
+            raise InfrastructureFailure("unavailable", f"no link to center '{center}'", True)
+        host, port = self.peers[center]
+        try:
+            sock = _socket.create_connection((host, port), timeout=5)
+        except OSError as e:
+            raise InfrastructureFailure("unavailable", f"center '{center}' silent: {e}", True)
+        chan = TcpChannel(sock)
+        try:
+            _chan_send(chan, forwarded)
+            reply = _recv_frame(chan, timeout=5)
+        finally:
+            chan.close()
+        if reply is None:
+            raise InfrastructureFailure("timeout", f"center '{center}' did not answer", True)
         return reply
 
     def _route_toward(self, recipient: Address) -> str | None:
@@ -233,9 +265,10 @@ class CenterNode:
         if self.link_key is None:
             return dict(env.body)
         raw = json.dumps(env.body, sort_keys=True).encode()
-        iv = os.urandom(16)
-        payload = secure_encrypt(self.link_key, iv, raw)
-        return {"__secure__": True, "iv": base64.b64encode(iv).decode(),
+        iv = bytearray(os.urandom(16))
+        iv[0] &= 0x7F  # MGM reserves the top bit of the ICN
+        payload = secure_encrypt(self.link_key, bytes(iv), raw)
+        return {"__secure__": True,
                 "payload": base64.b64encode(payload).decode()}
 
     def _unsecure_body(self, secure_body: dict) -> dict:
@@ -243,9 +276,8 @@ class CenterNode:
             return dict(secure_body)
         if self.link_key is None:
             raise NotPermitted("secure bundle received but this node has no key")
-        iv = base64.b64decode(secure_body["iv"])
         payload = base64.b64decode(secure_body["payload"])
-        return json.loads(secure_decrypt(self.link_key, iv, payload))
+        return json.loads(secure_decrypt(self.link_key, payload))
 
     # -- capability guard ------------------------------------------------------------
     def authorize_or_refuse(self, sender_urn: str, capability: str) -> None:
