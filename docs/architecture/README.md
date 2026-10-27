@@ -1,8 +1,16 @@
 # MLACP architecture — concept-to-code map
 
+> **Visual drawing of the implemented architecture:**
+> open [`architecture.html`](architecture.html) (self-contained, no
+> dependencies) — or view it rendered at
+> <https://mrschneider.github.io/mlacp/architecture.html> once Pages is
+> enabled. It shows the two federated centers, the one-entrance wire
+> (8 verbs), the six layers with their doctrine provenance, the GOST stack
+> and the VKO epoch re-keying path.
+
 ## Invariants (each enforced where noted)
 
-1. **The wire vocabulary is closed.** Seven kinds; `parse_frame` refuses
+1. **The wire vocabulary is closed.** Eight kinds; `parse_frame` refuses
    unknown verbs naming the verb and the legal set (`messages.parse_frame`).
 2. **One validation entrance.** Every frame passes `parse_frame` +
    `Envelope.from_value` / `Bundle.from_value`; handlers trust the result.

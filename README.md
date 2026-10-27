@@ -10,7 +10,9 @@ reference architectures of the Soviet / Russian communications tradition** —
 national network doctrines, military store-and-dump relaying, field
 communications grids and the GOST cryptographic standards. See
 [docs/research/soviet-communications-architectures.md](docs/research/soviet-communications-architectures.md)
-for the sources behind every layer.
+for the sources behind every layer and
+[docs/architecture.html](docs/architecture.html) for the **drawing of the
+implemented architecture** (open it in any browser — self-contained HTML).
 
 ## The six layers
 
