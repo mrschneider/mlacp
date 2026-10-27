@@ -12,7 +12,7 @@ docs/research/soviet-communications-architectures.md):
 - layer 6  GOST cryptographic layer          (mlacp_core.gost)
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 from .addresses import Address  # noqa: F401
 from .authority import CapabilityChain, DelegationEscalation, NotPermitted  # noqa: F401
