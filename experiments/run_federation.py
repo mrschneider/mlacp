@@ -116,7 +116,12 @@ def main() -> int:
     listener1.close()
     listener2.close()
     uds_listener.close()
+    # give the daemon serve threads a beat to die QUIETLY — an interpreter
+    # shutdown race with their stderr writes aborts the process (exit 134)
+    time.sleep(0.5)
+    sys.stdout.flush()
     print(f"\nEXPERIMENT_MLACP_FEDERATION: {'PASS' if failed == 0 else 'FAIL'}")
+    sys.stdout.flush()
     return 1 if failed else 0
 
 

@@ -431,12 +431,19 @@ def serve(node: CenterNode, listener, run_flag: threading.Event) -> threading.Th
 
 
 def _serve_conn(node: CenterNode, chan) -> None:
-    while True:
-        f = _recv_frame(chan, timeout=0.5)
-        if f is None:
-            break
-        reply = node.handle_frame(f, conn=chan)
-        if reply is not None:
-            _chan_send(chan, reply)
-    node.handle_frame(frame("close"), conn=chan)
-    chan.close()
+    try:
+        while True:
+            f = _recv_frame(chan, timeout=0.5)
+            if f is None:
+                break
+            reply = node.handle_frame(f, conn=chan)
+            if reply is not None:
+                try:
+                    _chan_send(chan, reply)
+                except OSError:
+                    break  # the peer hung up mid-reply: not an error
+        node.handle_frame(frame("close"), conn=chan)
+    except OSError:
+        pass  # a dying connection is the peer's business, not a crash
+    finally:
+        chan.close()
