@@ -54,13 +54,23 @@ class CenterNode:
         self.directory = directory or HierarchicalDirectory()
         self.relay = relay or CustodyRelay()
         self.authority = authority or CapabilityChain()
-        self.link_key = link_key
+        # the link keys, NEWEST FIRST is not the order: list[-1] is the
+        # CURRENT epoch key; older epochs stay decryptable during the
+        # re-key window (in-flight traffic), forward secrecy means the OLD
+        # key never protects NEW traffic (encrypt always uses list[-1])
+        self.link_keys: list[bytes] = [link_key] if link_key else []
+        self._epoch = 1 if link_key else 0
         self.journal: list[dict] = []
         self._lock = threading.Lock()
         self._conns: dict[str, object] = {}       # service urn -> channel-like
         self._contact_fn = None                   # grid hook: (center)->node|None
         self.peers: dict[str, tuple[str, int]] = {}   # center -> (host, port)
         self._pending_handshake: tuple | None = None
+
+    @property
+    def link_key(self) -> bytes | None:
+        """The CURRENT-epoch link key (None before any handshake)."""
+        return self.link_keys[-1] if self.link_keys else None
 
     # -- journaling -----------------------------------------------------------
     def _jour(self, event: str, **fields) -> None:
@@ -274,43 +284,74 @@ class CenterNode:
 
     # -- secure bodies (layer 6) -----------------------------------------------------
     def _secure_body(self, env: Envelope) -> dict:
-        if self.link_key is None:
+        if not self.link_keys:
             return dict(env.body)
         raw = json.dumps(env.body, sort_keys=True).encode()
         iv = bytearray(os.urandom(16))
         iv[0] &= 0x7F  # MGM reserves the top bit of the ICN
-        payload = secure_encrypt(self.link_key, bytes(iv), raw)
+        # ALWAYS the current-epoch key: the old key never protects new traffic
+        payload = secure_encrypt(self.link_keys[-1], bytes(iv), raw)
         return {"__secure__": True,
                 "payload": base64.b64encode(payload).decode()}
 
     def _unsecure_body(self, secure_body: dict) -> dict:
         if not secure_body.get("__secure__"):
             return dict(secure_body)
-        if self.link_key is None:
+        if not self.link_keys:
             raise NotPermitted("secure bundle received but this node has no key")
         payload = base64.b64decode(secure_body["payload"])
-        return json.loads(secure_decrypt(self.link_key, payload))
+        # the re-key window: try the newest epoch first, then the older ones
+        # (in-flight traffic encrypted before a re-key still opens here —
+        # but a key the node never held NEVER will)
+        last_err: Exception | None = None
+        for key in reversed(self.link_keys):
+            try:
+                return json.loads(secure_decrypt(key, payload))
+            except ValueError as e:
+                last_err = e
+        raise BusinessRefusal(
+            f"body encrypted under an unknown key epoch: {last_err}")
 
     # -- VKO handshake (layer 6 over layer 1) ---------------------------------
-    def initiate_handshake(self, curve=None) -> dict:
+    def initiate_handshake(self, curve=None, epoch: int | None = None) -> dict:
         """Produce the `handshake` OFFER frame: this center generates an
         ephemeral VKO keypair (ГОСТ Р 34.10-2012) and a random UKM. The peer
         answers `accept`, and both sides derive the SAME KEK (the agreement
         is symmetric — proven against RFC 7836 §B), which becomes the link
-        key protecting all subsequent envelope/custody traffic."""
+        key protecting all subsequent envelope/custody traffic. Calling this
+        again on an ESTABLISHED link starts a NEW EPOCH (epoch = previous+1):
+        fresh ephemerals, a fresh KEK — forward secrecy, the old key never
+        encrypts new traffic."""
         from mlacp_core.gost_ec import CURVE_512A, generate_keypair, \
             point_to_wire
         import os
         curve = curve or CURVE_512A
         d, pub = generate_keypair(curve)
         ukm = int.from_bytes(os.urandom(8), "little")
-        self._pending_handshake = (curve, d, ukm)
+        epoch = self._epoch + 1 if epoch is None else epoch
+        self._pending_handshake = (curve, d, ukm, epoch)
         return frame("handshake", role="offer", curve=curve.name,
-                     ukm=ukm, **point_to_wire(curve, pub))
+                     ukm=ukm, epoch=epoch, **point_to_wire(curve, pub))
+
+    def rekey(self) -> dict:
+        """Start the next key epoch on an established link."""
+        if not self.link_keys:
+            raise BusinessRefusal("rekey before any handshake")
+        return self.initiate_handshake()
+
+    def _adopt_link_key(self, kek: bytes, epoch: int, role: str,
+                        curve_name: str, ukm: int) -> None:
+        if epoch <= self._epoch and kek in self.link_keys:
+            return  # replayed/retransmitted accept for a known epoch
+        self.link_keys.append(kek)
+        self.link_keys = self.link_keys[-3:]  # the re-key window
+        self._epoch = max(self._epoch, epoch)
+        self._jour("handshake_complete", role=role, epoch=epoch,
+                   curve=curve_name, ukm=ukm)
 
     def _on_handshake(self, f, conn) -> dict | None:
         from mlacp_core.gost_ec import (CURVE_512A, CURVE_256A, generate_keypair,
-                                        point_from_wire, point_to_wire, vko)
+                                        point_to_wire, vko)
         curves = {c.name: c for c in (CURVE_512A, CURVE_256A)}
         role = f.get("role")
         if role not in ("offer", "accept"):
@@ -321,19 +362,18 @@ class CenterNode:
             curve = curves.get(f.get("curve"), CURVE_512A)
             peer_pub = self._peer_point(curve, f)
             ukm = int(f.get("ukm", 1))
+            epoch = int(f.get("epoch", 1))
             d, pub = generate_keypair(curve)
             # KEK from OUR ephemeral private key and THEIR public point
-            self.link_key = vko(curve, d, peer_pub, ukm, bits=256)
-            self._jour("handshake_complete", role="acceptor",
-                       curve=curve.name, ukm=ukm)
+            kek = vko(curve, d, peer_pub, ukm, bits=256)
+            self._adopt_link_key(kek, epoch, "acceptor", curve.name, ukm)
             return frame("handshake", role="accept", curve=curve.name,
-                         **point_to_wire(curve, pub))
+                         epoch=epoch, **point_to_wire(curve, pub))
         if role == "accept":
-            curve, d, ukm = self._pending_handshake
+            curve, d, ukm, epoch = self._pending_handshake
             peer_pub = self._peer_point(curve, f)
-            self.link_key = vko(curve, d, peer_pub, ukm, bits=256)
-            self._jour("handshake_complete", role="initiator",
-                       curve=curve.name, ukm=ukm)
+            kek = vko(curve, d, peer_pub, ukm, bits=256)
+            self._adopt_link_key(kek, epoch, "initiator", curve.name, ukm)
             self._pending_handshake = None
             return None
         raise BusinessRefusal("handshake role must be 'offer' or 'accept'")

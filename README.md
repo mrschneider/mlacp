@@ -25,7 +25,7 @@ refusal is the feature. Every refusal is typed and answered in-protocol.
 
 ## Verified results
 
-- **85 unit tests pass** (`python -m pytest tests/ -q`).
+- **87 unit tests pass** (`python -m pytest tests/ -q`).
 - **Kuznyechik verified against every official example of RFC 7801 §5** —
   substitution, linear transform, key schedule (K1..K10), encryption and
   decryption, byte for byte.
@@ -55,7 +55,12 @@ refusal is the feature. Every refusal is typed and answered in-protocol.
   carries the ephemeral public point (LE) + UKM, the acceptor replies, and
   both sides hold the identical KEK_256 (symmetry proven on the wire in the
   test); the derived key immediately protects envelope traffic, and a
-  public point not on the curve is refused in-protocol.
+  public point not on the curve is refused in-protocol. **Epoch re-keying**
+  (`rekey()`): an ESTABLISHED link rotates to a fresh KEK from fresh
+  ephemerals — new traffic is NEVER decryptable under the previous epoch's
+  key (forward secrecy, proven in the test), while the bounded in-flight
+  window still opens traffic captured before the rotation, and replayed
+  accept frames are a no-op.
 - **Cross-language E2E**: a Node.js client (`experiments/client.js`) drives
   the Python reference center over TCP through registration, envelope
   ping-pong, custody with dump-on-return, and typed refusals:
@@ -140,9 +145,9 @@ chain.delegate(root, "mlacp:front/west/hq", ["nuclear"])     # DelegationEscalat
 - MGM-ACPKM is not a standardized mode (the draft defines GCM/CBC/CTR over
   meshed keys); the MGM path uses single-key AEAD, the meshed AEAD path is
   GCM-ACPKM(-Master).
-- The handshake derives one static KEK per center pair per session; forward
-  secrecy across re-keying of an ESTABLISHED link (fresh ephemerals per
-  epoch) is future work.
+- The handshake derives one KEK per center pair per EPOCH; the re-key is
+  initiated manually (`rekey()`) — automatic rotation on traffic volume or
+  time is future work.
 
 ## Layout
 
