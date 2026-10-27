@@ -1,0 +1,14 @@
+[package]
+name = "mlacp-gost"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mlacp_gost_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["abi3-py310"] }
+
+[profile.release]
+lto = true

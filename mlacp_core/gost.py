@@ -1139,3 +1139,35 @@ def gcm_acpkm_master_decrypt(key: bytes, icn: bytes, aad: bytes,
     if computed[:len(tag)] != tag:
         raise ValueError("GCM-ACPKM-Master tag verification failed")
     return ct
+
+
+# ---------------------------------------------------------------------------
+# Optional native backend (Rust/PyO3, `native/mlacp-gost`).
+#
+# The pure-Python code above is the readable REFERENCE; the native module is
+# the fast path for the frame hot path only. Both implement the SAME
+# functions and are verified by the SAME RFC vectors in tests/test_gost.py —
+# conformance is per-backend, never assumed. Set MLACP_PURE=1 to force the
+# pure-Python path (e.g. to bisect a discrepancy, or where the wheel is not
+# available).
+# ---------------------------------------------------------------------------
+import os as _os
+
+if not _os.environ.get("MLACP_PURE"):
+    try:
+        from mlacp_gost_rs import (  # type: ignore[import-not-found]
+            ctr_decrypt as _rs_ctr_decrypt,
+            ctr_encrypt as _rs_ctr_encrypt,
+            secure_decrypt as _rs_secure_decrypt,
+            secure_encrypt as _rs_secure_encrypt,
+        )
+
+        secure_encrypt = _rs_secure_encrypt
+        secure_decrypt = _rs_secure_decrypt
+        ctr_encrypt = _rs_ctr_encrypt
+        ctr_decrypt = _rs_ctr_decrypt
+        NATIVE_BACKEND = True
+    except ImportError:
+        NATIVE_BACKEND = False
+else:
+    NATIVE_BACKEND = False
