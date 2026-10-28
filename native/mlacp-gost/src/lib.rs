@@ -11,12 +11,14 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+pub mod ct;
+mod sbox_anf;
 mod streebog;
 mod streebog_tables;
 
 // --- Kuznyechik parameters (RFC 7801 §4.1) --------------------------------
 
-const PI: [u8; 256] = [
+pub const PI: [u8; 256] = [
     252, 238, 221, 17, 207, 110, 49, 22, 251, 196, 250, 218, 35, 197, 4, 77, 233, 119, 240, 219,
     147, 46, 153, 186, 23, 54, 241, 187, 20, 205, 95, 193, 249, 24, 101, 90, 226, 92, 239, 33, 129,
     28, 60, 66, 139, 1, 142, 79, 5, 132, 2, 174, 227, 106, 143, 160, 6, 11, 237, 152, 127, 212,
@@ -100,7 +102,7 @@ fn r_lin(a: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-fn l_lin(a: &[u8; 16]) -> [u8; 16] {
+pub fn l_lin(a: &[u8; 16]) -> [u8; 16] {
     let mut t = *a;
     for _ in 0..16 {
         t = r_lin(&t);
@@ -484,6 +486,7 @@ fn mlacp_gost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(streebog::streebog_512, m)?)?;
     m.add_function(wrap_pyfunction!(streebog::streebog_practical, m)?)?;
     m.add_function(wrap_pyfunction!(kuznyechik_encrypt_block, m)?)?;
+    m.add_function(wrap_pyfunction!(kuznyechik_encrypt_block_ct, m)?)?;
     m.add_function(wrap_pyfunction!(kuznyechik_decrypt_block, m)?)?;
     m.add_function(wrap_pyfunction!(ctr_encrypt, m)?)?;
     m.add_function(wrap_pyfunction!(ctr_decrypt, m)?)?;
@@ -520,5 +523,101 @@ mod timing {
 
     fn key_vec() -> Vec<u8> {
         vec![7u8; 32]
+    }
+}
+
+/// Raw constant-time Kuznyechik block (ANF S-box + matrix L). For hostile
+/// co-tenancy threat models; ~1000x slower than the table path.
+#[pyfunction]
+fn kuznyechik_encrypt_block_ct(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
+    if block.len() != 16 {
+        return Err(PyValueError::new_err(
+            "Kuznyechik operates on 16-byte blocks",
+        ));
+    }
+    let c = Kuznyechik::new(&key)?;
+    let blk: [u8; 16] = block.try_into().unwrap();
+    let mut t = blk;
+    for k in c.rk.iter().take(9) {
+        t = ct::lsx_ct(k, &t);
+    }
+    Ok(xor16(&c.rk[9], &t).to_vec())
+}
+
+#[cfg(test)]
+mod ct_tests {
+    use super::*;
+    use crate::ct::lsx_ct;
+
+    #[test]
+    fn ct_path_matches_the_table_path_byte_for_byte() {
+        // Kuznyechik struct is private; rebuild the block function here via
+        // the same round keys is not possible — instead verify through the
+        // composition the vectors pin: use Kuznyechik::encrypt via l_lin path
+        // by comparing lsx vs lsx_ct for random (k, a) pairs against the
+        // pure l_lin(sub_s(xor)) definition.
+        let mut seed = 0x5eedu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..64 {
+            let mut k = [0u8; 16];
+            let mut a = [0u8; 16];
+            for i in 0..16 {
+                k[i] = (next() & 0xff) as u8;
+                a[i] = (next() & 0xff) as u8;
+            }
+            let expect = l_lin(&sub_s(&xor16(&k, &a)));
+            assert_eq!(lsx_ct(&k, &a), expect, "ct LSX diverged at k={k:?} a={a:?}");
+        }
+    }
+
+    #[test]
+    fn ct_full_block_matches_rfc_7801_5_5() {
+        // encrypt the RFC vector through the CT LSX chain with the same
+        // key schedule the Kuznyechik struct computes
+        let key = [
+            0x88u8, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef,
+        ];
+        let mut constants = [[0u8; 16]; 32];
+        for i in 0u8..32 {
+            let mut blk = [0u8; 16];
+            blk[15] = i + 1;
+            constants[i as usize] = l_lin(&blk);
+        }
+        let mut keys = [[0u8; 16]; 10];
+        keys[0] = key[..16].try_into().unwrap();
+        keys[1] = key[16..].try_into().unwrap();
+        let (mut a, mut b) = (keys[0], keys[1]);
+        let mut k = 2;
+        for i in 0..4 {
+            for j in 0..8 {
+                let na = xor16(&lsx_ct(&constants[8 * i + j], &a), &b);
+                b = a;
+                a = na;
+            }
+            keys[k] = a;
+            keys[k + 1] = b;
+            k += 2;
+        }
+        let pt = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa,
+            0x99, 0x88,
+        ];
+        let mut t = pt;
+        for kk in keys.iter().take(9) {
+            t = lsx_ct(kk, &t);
+        }
+        let ct = xor16(&keys[9], &t);
+        let want: [u8; 16] = [
+            0x7f, 0x67, 0x9d, 0x90, 0xbe, 0xbc, 0x24, 0x30, 0x5a, 0x46, 0x8d, 0x42, 0xb9, 0xd4,
+            0xed, 0xcd,
+        ];
+        assert_eq!(ct, want, "CT path must reproduce RFC 7801 5.5");
     }
 }
