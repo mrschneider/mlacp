@@ -23,30 +23,51 @@ implemented architecture** (open it in any browser — self-contained HTML).
 | 3 — communications grid | `mlacp_core.grid` | PASS field-grid doctrine (arteries, laterals, autonomy) |
 | 4 — hierarchical directory | `mlacp_core.directory` | OGAS / Akademset registration, zone-widening, per-org quota |
 | 5 — capability chain of custody | `mlacp_core.authority` | АСУ authority pyramid (delegation shrinks, revocation cascades) |
-| 6 — GOST cryptographic layer | `mlacp_core.gost` | Kuznyechik (GOST R 34.12-2015), CTR, CBC-MAC |
+| 6 — GOST cryptographic layer | `mlacp_core.gost` | Kuznyechik + Magma (GOST R 34.12-2015), CTR, MGM (RFC 9058), GOST MAC, Streebog (GOST R 34.11-2012), VKO handshake (RFC 7836), ACPKM key meshing |
 
 ## Performance & native backend
 
-`native/mlacp-gost/` is an optional Rust/PyO3 backend for the crypto hot
-path (Kuznyechik, CTR, MGM secure frames, Streebog in both conventions).
-`mlacp_core.gost` uses it automatically when installed; set `MLACP_PURE=1`
-to force the pure-Python reference. Both backends are verified by the SAME
-RFC vectors in CI. Measured 4 KB: secure frame ~0.6 ms native vs ~15 ms
-pure; Streebog ~1.3 ms vs ~300 ms.
+`native/mlacp-gost/` is a **Rust/PyO3 backend for the crypto hot path** —
+Kuznyechik, CTR, MGM secure frames, Streebog in both conventions and the raw
+block primitives, ported function-for-function from `mlacp_core.gost` (the
+pure-Python module remains the readable reference specification).
+`mlacp_core.gost` uses the native module automatically when installed; set
+`MLACP_PURE=1` to force the pure-Python path. **Both backends are verified
+by the SAME RFC vector suite** — conformance is per-backend, never assumed.
+
+Measured (4 KB): secure frame **~0.6 ms native vs ~15 ms pure** (26–36×),
+CTR ~0.2 ms vs ~4.8 ms, Streebog **~1.3 ms vs ~300 ms (225×)**; block cipher
+~150 ns/block. Against the original table-free pure-Python baseline the
+frame went from 1.41 s to 0.6 ms (~2,300×).
+
+**Release wheels** (`v0.2.7+`): one `abi3-py310` wheel per platform covers
+Python 3.10–3.14 — musl x86_64, musl aarch64, manylinux aarch64, macOS
+Intel, macOS ARM, Windows amd64. On any platform without a wheel the pure
+Python runs automatically, with identical conformance.
 
 Known non-constant-time behavior: the table-driven S-box/T-table
 implementations (both backends) index memory by secret data — acceptable
 for peer-authenticated links, not for hostile co-tenancy. Tag verification
-in the native backend is constant-time.
+in the native backend is constant-time (`ct_eq` XOR-fold). For the hostile
+co-tenancy threat model the crate also ships a **table-free constant-time
+S∘L** (`kuznyechik_encrypt_block_ct`): the S-box evaluated through its
+algebraic normal form (branchless AND/XOR circuit) and L as a 128×128 GF(2)
+matrix — verified against the same RFC 7801 vectors and pinned equal to the
+table path on random inputs; the price is ~7× per raw call (honest cost of
+no secret-indexed access in software).
 
-The wire vocabulary is **closed**: seven kinds (`hello`, `envelope`,
-`custody`, `custody_ack`, `route_update`, `error`, `close`). An unknown verb
-is refused *naming the word the peer sent and listing the legal set* — the
-refusal is the feature. Every refusal is typed and answered in-protocol.
+The wire vocabulary is **closed**: eight kinds (`hello`, `envelope`,
+`custody`, `custody_ack`, `route_update`, `error`, `close`, `handshake`).
+An unknown verb is refused *naming the word the peer sent and listing the
+legal set* — the refusal is the feature. Every refusal is typed and answered
+in-protocol.
 
 ## Verified results
 
-- **87 unit tests pass** (`python -m pytest tests/ -q`).
+- **87 unit tests pass on BOTH crypto backends** (`python -m pytest tests/ -q`
+  runs the native Rust backend when installed; `MLACP_PURE=1 python -m pytest
+  tests/ -q` runs the pure-Python reference — the same RFC vectors gate each
+  backend separately).
 - **Kuznyechik verified against every official example of RFC 7801 §5** —
   substitution, linear transform, key schedule (K1..K10), encryption and
   decryption, byte for byte.
@@ -176,7 +197,11 @@ chain.delegate(root, "mlacp:front/west/hq", ["nuclear"])     # DelegationEscalat
 mlacp_core/     IO-free contract: messages, addresses, custody, grid,
                 directory, authority, gost — no sockets
 mlacp_engine/   reference participant: channels + the CenterNode
-tests/          80 tests: RFC/draft vectors, per-layer contracts, node behavior
+native/         Rust/PyO3 backend for the GOST hot path (mlacp-gost crate)
+tests/          87 tests: RFC/draft vectors (both crypto backends), per-layer
+                contracts, node behavior
 experiments/    the Node.js client + the cross-language E2E driver
 docs/           research (with sources), architecture, requirements
+.github/        CI (fmt/clippy/tests/E2E + native crate gate) and the
+                release pipeline (test gate + 6-platform wheel matrix)
 ```
