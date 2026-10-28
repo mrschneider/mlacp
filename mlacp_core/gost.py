@@ -1160,12 +1160,18 @@ if not _os.environ.get("MLACP_PURE"):
             ctr_encrypt as _rs_ctr_encrypt,
             secure_decrypt as _rs_secure_decrypt,
             secure_encrypt as _rs_secure_encrypt,
+            streebog_256 as _rs_streebog_256,
+            streebog_512 as _rs_streebog_512,
+            streebog_practical as _rs_streebog_practical,
         )
 
         secure_encrypt = _rs_secure_encrypt
         secure_decrypt = _rs_secure_decrypt
         ctr_encrypt = _rs_ctr_encrypt
         ctr_decrypt = _rs_ctr_decrypt
+        streebog_256 = _rs_streebog_256
+        streebog_512 = _rs_streebog_512
+        streebog_practical = _rs_streebog_practical
         NATIVE_BACKEND = True
     except ImportError:
         NATIVE_BACKEND = False

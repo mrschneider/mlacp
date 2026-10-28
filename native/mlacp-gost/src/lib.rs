@@ -11,6 +11,9 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+mod streebog_tables;
+mod streebog;
+
 // --- Kuznyechik parameters (RFC 7801 §4.1) --------------------------------
 
 const PI: [u8; 256] = [
@@ -453,6 +456,10 @@ fn ctr_decrypt(key: Vec<u8>, iv: Vec<u8>, ciphertext: Vec<u8>) -> PyResult<Vec<u
 fn mlacp_gost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(secure_encrypt, m)?)?;
     m.add_function(wrap_pyfunction!(secure_decrypt, m)?)?;
+    m.add_function(wrap_pyfunction!(streebog::streebog, m)?)?;
+    m.add_function(wrap_pyfunction!(streebog::streebog_256, m)?)?;
+    m.add_function(wrap_pyfunction!(streebog::streebog_512, m)?)?;
+    m.add_function(wrap_pyfunction!(streebog::streebog_practical, m)?)?;
     m.add_function(wrap_pyfunction!(kuznyechik_encrypt_block, m)?)?;
     m.add_function(wrap_pyfunction!(kuznyechik_decrypt_block, m)?)?;
     m.add_function(wrap_pyfunction!(ctr_encrypt, m)?)?;
