@@ -28,8 +28,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build
+      - name: Build native wheel (Rust/PyO3, abi3-py310)
+        run: |
+          python -m pip install maturin
+          python -m maturin build --release -b pyo3 -m native/mlacp-gost/Cargo.toml --out dist-native
       - name: Create GitHub release with artifacts
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/*
+          files: |
+            dist/*
+            dist-native/*.whl

@@ -11,8 +11,8 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-mod streebog_tables;
 mod streebog;
+mod streebog_tables;
 
 // --- Kuznyechik parameters (RFC 7801 §4.1) --------------------------------
 
@@ -370,6 +370,29 @@ fn mgm_encrypt(
 
 const MGM_AAD: &[u8] = b"mlacp-secure-frame-v1";
 
+/// Constant-time byte-slice equality: folds the XOR of length-differing
+/// (padded) bytes so verification timing does not leak how many tag bytes
+/// matched. Length difference still shows (lengths are public on the wire);
+/// content does not.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+// KNOWN NON-CONSTANT-TIME behavior (documented, not fixed): the S-box and
+// fused S∘L T-tables index memory by SECRET data, so accesses are
+// cache-timing dependent — true of every table-driven software cipher and of
+// the pure-Python reference a fortiori. Acceptable for MLACP's current
+// threat model (peer-authenticated links, not hostile co-tenancy); revisit
+// with bitsliced/table-free implementations if side channels enter the
+// threat model.
+
 #[pyfunction]
 #[pyo3(signature = (key, iv, data))]
 fn secure_encrypt(key: Vec<u8>, iv: Vec<u8>, data: Vec<u8>) -> PyResult<Vec<u8>> {
@@ -408,7 +431,7 @@ fn secure_decrypt(key: Vec<u8>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
         incr_r(&mut y);
     }
     let expected = mgm_tag(&cipher, icn.try_into().unwrap(), MGM_AAD, ct, tag.len());
-    if expected != tag {
+    if !ct_eq(&expected, tag) {
         return Err(PyValueError::new_err(
             "MGM tag verification failed — frame altered in transit",
         ));

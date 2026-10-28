@@ -25,6 +25,20 @@ implemented architecture** (open it in any browser — self-contained HTML).
 | 5 — capability chain of custody | `mlacp_core.authority` | АСУ authority pyramid (delegation shrinks, revocation cascades) |
 | 6 — GOST cryptographic layer | `mlacp_core.gost` | Kuznyechik (GOST R 34.12-2015), CTR, CBC-MAC |
 
+## Performance & native backend
+
+`native/mlacp-gost/` is an optional Rust/PyO3 backend for the crypto hot
+path (Kuznyechik, CTR, MGM secure frames, Streebog in both conventions).
+`mlacp_core.gost` uses it automatically when installed; set `MLACP_PURE=1`
+to force the pure-Python reference. Both backends are verified by the SAME
+RFC vectors in CI. Measured 4 KB: secure frame ~0.6 ms native vs ~15 ms
+pure; Streebog ~1.3 ms vs ~300 ms.
+
+Known non-constant-time behavior: the table-driven S-box/T-table
+implementations (both backends) index memory by secret data — acceptable
+for peer-authenticated links, not for hostile co-tenancy. Tag verification
+in the native backend is constant-time.
+
 The wire vocabulary is **closed**: seven kinds (`hello`, `envelope`,
 `custody`, `custody_ack`, `route_update`, `error`, `close`). An unknown verb
 is refused *naming the word the peer sent and listing the legal set* — the
