@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -24,14 +24,61 @@ jobs:
         run: python -m pytest tests/ -q
       - name: Cross-language E2E gate
         run: python experiments/run_e2e.py
-      - name: Build distribution
+
+  native-wheels:
+    name: Native wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel (maturin-action cross-compiles via docker/cross)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist-native -i python3.12 -m native/mlacp-gost/Cargo.toml
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-wheel-${{ matrix.target }}
+          path: dist-native/*.whl
+
+  publish:
+    needs: [verify, native-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build Python distribution
         run: |
           python -m pip install --upgrade pip build
           python -m build
-      - name: Build native wheel (Rust/PyO3, abi3-py310)
-        run: |
-          python -m pip install maturin
-          python -m maturin build --release -b pyo3 -m native/mlacp-gost/Cargo.toml --out dist-native
+      - name: Download native wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-wheel-*
+          path: dist-native
+          merge-multiple: true
       - name: Create GitHub release with artifacts
         uses: softprops/action-gh-release@v2
         with:
