@@ -228,25 +228,21 @@ use pyo3::prelude::*;
 #[pyfunction]
 #[pyo3(signature = (message, bits=256))]
 pub fn streebog(py: Python<'_>, message: Vec<u8>, bits: usize) -> PyResult<Vec<u8>> {
-    py.allow_threads(|| streebog_core(&message, bits))
+    py.detach(|| streebog_core(&message, bits))
 }
 
 #[pyfunction]
 pub fn streebog_256(py: Python<'_>, message: Vec<u8>) -> PyResult<Vec<u8>> {
-    py.allow_threads(|| streebog_core(&message, 256))
+    py.detach(|| streebog_core(&message, 256))
 }
 
 #[pyfunction]
 pub fn streebog_512(py: Python<'_>, message: Vec<u8>) -> PyResult<Vec<u8>> {
-    py.allow_threads(|| streebog_core(&message, 512))
+    py.detach(|| streebog_core(&message, 512))
 }
 
 #[pyfunction]
 #[pyo3(signature = (message, bits=256))]
-pub fn streebog_practical(
-    py: Python<'_>,
-    message: Vec<u8>,
-    bits: usize,
-) -> PyResult<Vec<u8>> {
-    py.allow_threads(|| streebog_practical_core(&message, bits))
+pub fn streebog_practical(py: Python<'_>, message: Vec<u8>, bits: usize) -> PyResult<Vec<u8>> {
+    py.detach(|| streebog_practical_core(&message, bits))
 }

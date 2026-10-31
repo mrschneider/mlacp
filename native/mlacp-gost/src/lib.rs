@@ -395,7 +395,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // with bitsliced/table-free implementations if side channels enter the
 // threat model.
 
-// Every heavy function runs OUTSIDE the GIL (py.allow_threads): the node
+// Every heavy function runs OUTSIDE the GIL (py.detach): the node
 // serves one thread per connection (mlacp_engine.node.serve), so without
 // this the native crypto would serialize all concurrent frames. The inputs
 // are Vec<u8> copies made BEFORE the release, so the closure holds no
@@ -403,21 +403,15 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[pyfunction]
 #[pyo3(signature = (key, iv, data))]
-fn secure_encrypt(
-    py: Python<'_>,
-    key: Vec<u8>,
-    iv: Vec<u8>,
-    data: Vec<u8>,
-) -> PyResult<Vec<u8>> {
-    let out = py.allow_threads(|| {
+fn secure_encrypt(py: Python<'_>, key: Vec<u8>, iv: Vec<u8>, data: Vec<u8>) -> PyResult<Vec<u8>> {
+    py.detach(|| {
         let (ct, tag) = mgm_encrypt(&key, &iv, MGM_AAD, &data, 16)?;
         let mut out = Vec::with_capacity(16 + ct.len() + 16);
         out.extend_from_slice(&iv);
         out.extend_from_slice(&ct);
         out.extend_from_slice(&tag);
         Ok(out)
-    });
-    out
+    })
 }
 
 #[pyfunction]
@@ -435,7 +429,7 @@ fn secure_decrypt(py: Python<'_>, key: Vec<u8>, payload: Vec<u8>) -> PyResult<Ve
             "MGM ICN must be 16 bytes with the top bit zero",
         ));
     }
-    py.allow_threads(|| {
+    py.detach(|| {
         let cipher = Kuznyechik::new(&key)?;
         let mut y = cipher.encrypt_block(icn.try_into().unwrap());
         let mut pt = Vec::with_capacity(ct.len());
@@ -460,11 +454,7 @@ fn secure_decrypt(py: Python<'_>, key: Vec<u8>, payload: Vec<u8>) -> PyResult<Ve
 /// Raw Kuznyechik block primitive (exposed for tests and future modes —
 /// MGM itself never inverts a block).
 #[pyfunction]
-fn kuznyechik_encrypt_block(
-    py: Python<'_>,
-    key: Vec<u8>,
-    block: Vec<u8>,
-) -> PyResult<Vec<u8>> {
+fn kuznyechik_encrypt_block(py: Python<'_>, key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
     if block.len() != 16 {
         return Err(PyValueError::new_err(
             "Kuznyechik operates on 16-byte blocks",
@@ -472,15 +462,11 @@ fn kuznyechik_encrypt_block(
     }
     let c = Kuznyechik::new(&key)?;
     let blk: [u8; 16] = block.try_into().unwrap();
-    py.allow_threads(|| Ok(c.encrypt_block(&blk).to_vec()))
+    py.detach(|| Ok(c.encrypt_block(&blk).to_vec()))
 }
 
 #[pyfunction]
-fn kuznyechik_decrypt_block(
-    py: Python<'_>,
-    key: Vec<u8>,
-    block: Vec<u8>,
-) -> PyResult<Vec<u8>> {
+fn kuznyechik_decrypt_block(py: Python<'_>, key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
     if block.len() != 16 {
         return Err(PyValueError::new_err(
             "Kuznyechik operates on 16-byte blocks",
@@ -488,17 +474,12 @@ fn kuznyechik_decrypt_block(
     }
     let c = Kuznyechik::new(&key)?;
     let blk: [u8; 16] = block.try_into().unwrap();
-    py.allow_threads(|| Ok(c.decrypt_block(&blk).to_vec()))
+    py.detach(|| Ok(c.decrypt_block(&blk).to_vec()))
 }
 
 #[pyfunction]
-fn ctr_encrypt(
-    py: Python<'_>,
-    key: Vec<u8>,
-    iv: Vec<u8>,
-    plaintext: Vec<u8>,
-) -> PyResult<Vec<u8>> {
-    py.allow_threads(|| ctr_keystream_xor(&key, &iv, &plaintext))
+fn ctr_encrypt(py: Python<'_>, key: Vec<u8>, iv: Vec<u8>, plaintext: Vec<u8>) -> PyResult<Vec<u8>> {
+    py.detach(|| ctr_keystream_xor(&key, &iv, &plaintext))
 }
 
 #[pyfunction]
@@ -508,7 +489,7 @@ fn ctr_decrypt(
     iv: Vec<u8>,
     ciphertext: Vec<u8>,
 ) -> PyResult<Vec<u8>> {
-    py.allow_threads(|| ctr_keystream_xor(&key, &iv, &ciphertext))
+    py.detach(|| ctr_keystream_xor(&key, &iv, &ciphertext))
 }
 
 #[pymodule]
@@ -563,11 +544,7 @@ mod timing {
 /// Raw constant-time Kuznyechik block (ANF S-box + matrix L). For hostile
 /// co-tenancy threat models; ~1000x slower than the table path.
 #[pyfunction]
-fn kuznyechik_encrypt_block_ct(
-    py: Python<'_>,
-    key: Vec<u8>,
-    block: Vec<u8>,
-) -> PyResult<Vec<u8>> {
+fn kuznyechik_encrypt_block_ct(py: Python<'_>, key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
     if block.len() != 16 {
         return Err(PyValueError::new_err(
             "Kuznyechik operates on 16-byte blocks",
@@ -575,7 +552,7 @@ fn kuznyechik_encrypt_block_ct(
     }
     let c = Kuznyechik::new(&key)?;
     let blk: [u8; 16] = block.try_into().unwrap();
-    py.allow_threads(|| {
+    py.detach(|| {
         let mut t = blk;
         for k in c.rk.iter().take(9) {
             t = ct::lsx_ct(k, &t);
