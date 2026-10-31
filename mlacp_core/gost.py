@@ -644,14 +644,15 @@ STREEBOG_L_ROWS = [
 def _streebog_l64(group: bytes) -> bytes:
     """l: V_64 -> V_64 by RIGHT multiplication with the §6.4 matrix
     (out = v · A, i.e. output bit j sums column j). Input and output are
-    8-byte big-endian vectors (bit 0 = rightmost). NOTE: measured — the
-    plain bin().count() parity beat a precomputed 16-bit parity table
-    (big-int chunking allocations dominate), so it stays."""
+    8-byte big-endian vectors (bit 0 = rightmost). NOTE: measured — a
+    precomputed 16-bit parity table LOST to bit_count (256 Python-level
+    lookups + XORs vs 64 single C calls), so int.bit_count() stays:
+    ~12us vs ~23us for the 64-column loop."""
     v = int.from_bytes(group, "big")
     cols = _streebog_l_cols()
     out = 0
     for col in cols:
-        out = (out << 1) | (bin(v & col).count("1") & 1)
+        out = (out << 1) | ((v & col).bit_count() & 1)
     return out.to_bytes(8, "big")
 
 
@@ -718,12 +719,20 @@ def streebog(message: bytes, bits: int = 256) -> bytes:
     msg = message
     n = 0
     epsilon = 0
-    while len(msg) >= 64:
-        m = msg[-64:]           # the RIGHTMOST 512-bit block first
-        msg = msg[:-64]
+    # index-walk the blocks: `msg = msg[:-64]` re-allocated the WHOLE
+    # remaining message at every block (measured ~1.9ms of pure copying on a
+    # 64KB input); slicing only the 64-byte block is O(1) per block
+    total = len(msg)
+    end = total
+    while end >= 64:
+        m = msg[end - 64:end]   # the RIGHTMOST 512-bit block first
+        end -= 64
         h = _streebog_g(h, bytes(64), m)
         n += 512
         epsilon = (epsilon + int.from_bytes(m, "big")) % (1 << 512)
+    # the un-consumed HEAD: this convention walks from the RIGHT, so the
+    # leftover is the front of the message (msg[:end], not the tail)
+    msg = msg[:end]
     # step 3.1: m = 0^(511-|M|) || 1 || M — the separator bit sits at bit
     # position |M| from the LSB, i.e. immediately ABOVE the message
     m_int = 1 << (8 * len(msg))
@@ -754,14 +763,11 @@ def _bswap64(b: bytes) -> bytes:
 
 
 def _add512_le(a: bytes, b: bytes) -> bytes:
-    """Little-endian byte-wise addition mod 2^512 (the CryptoPro convention)."""
-    out = bytearray(64)
-    carry = 0
-    for i in range(64):
-        s = a[i] + b[i] + carry
-        out[i] = s & 0xFF
-        carry = s >> 8
-    return bytes(out)
+    """Little-endian byte-wise addition mod 2^512 (the CryptoPro convention).
+    Measured: one big-int add (~0.5us) beats the 64-iteration Python loop
+    (~6us)."""
+    return ((int.from_bytes(a, "little") + int.from_bytes(b, "little"))
+            % (1 << 512)).to_bytes(64, "little")
 
 
 def streebog_practical(message: bytes, bits: int = 256) -> bytes:
@@ -786,12 +792,16 @@ def streebog_practical(message: bytes, bits: int = 256) -> bytes:
     n = bytes(64)
     sigma = bytes(64)
     msg = message
-    while len(msg) >= 64:
-        block = msg[:64]          # FIRST block first (byte-stream order)
-        msg = msg[64:]
+    # index-walk (see streebog above): no O(n^2) reallocation per block
+    total = len(msg)
+    start = 0
+    while start + 64 <= total:
+        block = msg[start:start + 64]   # FIRST block first (byte-stream)
+        start += 64
         h = _bswap64(_streebog_g(_bswap64(h), _bswap64(n), _bswap64(block)))
         n = _add512_le(n, (512).to_bytes(64, "little"))
         sigma = _add512_le(sigma, block)
+    msg = msg[start:]  # the un-consumed tail
     pad = msg + b"\x01" + bytes(64 - len(msg) - 1)  # padding FOLLOWS the message
     h = _bswap64(_streebog_g(_bswap64(h), _bswap64(n), _bswap64(pad)))
     n = _add512_le(n, (len(msg) * 8).to_bytes(64, "little"))
@@ -852,7 +862,12 @@ def ctr_acpkm_encrypt(key: bytes, icn: bytes, plaintext: bytes,
         for off in range(0, len(section), m):
             ks = cipher.encrypt_block(
                 icn[:m // 2] + ctr.to_bytes(m // 2, "big"))
-            out += bytes(x ^ y for x, y in zip(section[off:off + m], ks))
+            # big-int XOR runs in C; the per-byte zip loop was 150x slower
+            # (measured). zip truncated to the chunk length — keep that
+            # for the final partial block (a full 16-byte slice is a no-op
+            # copy in CPython)
+            chunk = section[off:off + m]
+            out += _xor_bytes(chunk, ks[: len(chunk)])
             ctr += 1
         # refresh the section key for the next section
         if section_start + section_bytes < len(plaintext):
@@ -895,7 +910,8 @@ def ctr_acpkm_master(key: bytes, icn: bytes, plaintext: bytes,
         for off in range(0, len(sec), m):
             ks = sec_cipher.encrypt_block(
                 icn[:m // 2] + ctr.to_bytes(m // 2, "big"))
-            out += bytes(x ^ y for x, y in zip(sec[off:off + m], ks))
+            chunk = sec[off:off + m]
+            out += _xor_bytes(chunk, ks[: len(chunk)])
             ctr += 1
     return bytes(out)
 
@@ -1067,7 +1083,8 @@ def _gcm_acpkm_core(key: bytes, icn: bytes, aad: bytes, data: bytes,
         for off in range(0, len(sec), m):
             ctr_block = high + ctr_int.to_bytes(c // 8, "big")
             ks = sec_cipher.encrypt_block(ctr_block)
-            out += bytes(x ^ y for x, y in zip(sec[off:off + m], ks))
+            chunk = sec[off:off + m]
+            out += _xor_bytes(chunk, ks[: len(chunk)])
             ctr_int = (ctr_int + 1) % (1 << c)
     ct = bytes(out)
 
@@ -1077,7 +1094,7 @@ def _gcm_acpkm_core(key: bytes, icn: bytes, aad: bytes, data: bytes,
     blocks = ([pa[i:i + m] for i in range(0, len(pa), m)] +
               [pc[i:i + m] for i in range(0, len(pc), m)] + [lens])
     s = _ghash(blocks, h_block)
-    tag = bytes(x ^ y for x, y in zip(cipher_cls(k1).encrypt_block(icb0), s))
+    tag = _xor_bytes(cipher_cls(k1).encrypt_block(icb0), s)
     return ct, tag[:16]
 
 

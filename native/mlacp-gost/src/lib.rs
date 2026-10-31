@@ -395,19 +395,33 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // with bitsliced/table-free implementations if side channels enter the
 // threat model.
 
+// Every heavy function runs OUTSIDE the GIL (py.allow_threads): the node
+// serves one thread per connection (mlacp_engine.node.serve), so without
+// this the native crypto would serialize all concurrent frames. The inputs
+// are Vec<u8> copies made BEFORE the release, so the closure holds no
+// Python references.
+
 #[pyfunction]
 #[pyo3(signature = (key, iv, data))]
-fn secure_encrypt(key: Vec<u8>, iv: Vec<u8>, data: Vec<u8>) -> PyResult<Vec<u8>> {
-    let (ct, tag) = mgm_encrypt(&key, &iv, MGM_AAD, &data, 16)?;
-    let mut out = Vec::with_capacity(16 + ct.len() + 16);
-    out.extend_from_slice(&iv);
-    out.extend_from_slice(&ct);
-    out.extend_from_slice(&tag);
-    Ok(out)
+fn secure_encrypt(
+    py: Python<'_>,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    data: Vec<u8>,
+) -> PyResult<Vec<u8>> {
+    let out = py.allow_threads(|| {
+        let (ct, tag) = mgm_encrypt(&key, &iv, MGM_AAD, &data, 16)?;
+        let mut out = Vec::with_capacity(16 + ct.len() + 16);
+        out.extend_from_slice(&iv);
+        out.extend_from_slice(&ct);
+        out.extend_from_slice(&tag);
+        Ok(out)
+    });
+    out
 }
 
 #[pyfunction]
-fn secure_decrypt(key: Vec<u8>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
+fn secure_decrypt(py: Python<'_>, key: Vec<u8>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
     if payload.len() < 32 {
         return Err(PyValueError::new_err(
             "secure frame too short — iv(16) || ct || tag(16)",
@@ -421,30 +435,36 @@ fn secure_decrypt(key: Vec<u8>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
             "MGM ICN must be 16 bytes with the top bit zero",
         ));
     }
-    let cipher = Kuznyechik::new(&key)?;
-    let mut y = cipher.encrypt_block(icn.try_into().unwrap());
-    let mut pt = Vec::with_capacity(ct.len());
-    for block in ct.chunks(16) {
-        let ks = cipher.encrypt_block(&y);
-        // the MGM keystream is symmetric: plaintext = ct XOR keystream
-        for (i, &b) in block.iter().enumerate() {
-            pt.push(b ^ ks[i]);
+    py.allow_threads(|| {
+        let cipher = Kuznyechik::new(&key)?;
+        let mut y = cipher.encrypt_block(icn.try_into().unwrap());
+        let mut pt = Vec::with_capacity(ct.len());
+        for block in ct.chunks(16) {
+            let ks = cipher.encrypt_block(&y);
+            // the MGM keystream is symmetric: plaintext = ct XOR keystream
+            for (i, &b) in block.iter().enumerate() {
+                pt.push(b ^ ks[i]);
+            }
+            incr_r(&mut y);
         }
-        incr_r(&mut y);
-    }
-    let expected = mgm_tag(&cipher, icn.try_into().unwrap(), MGM_AAD, ct, tag.len());
-    if !ct_eq(&expected, tag) {
-        return Err(PyValueError::new_err(
-            "MGM tag verification failed — frame altered in transit",
-        ));
-    }
-    Ok(pt)
+        let expected = mgm_tag(&cipher, icn.try_into().unwrap(), MGM_AAD, ct, tag.len());
+        if !ct_eq(&expected, tag) {
+            return Err(PyValueError::new_err(
+                "MGM tag verification failed — frame altered in transit",
+            ));
+        }
+        Ok(pt)
+    })
 }
 
 /// Raw Kuznyechik block primitive (exposed for tests and future modes —
 /// MGM itself never inverts a block).
 #[pyfunction]
-fn kuznyechik_encrypt_block(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
+fn kuznyechik_encrypt_block(
+    py: Python<'_>,
+    key: Vec<u8>,
+    block: Vec<u8>,
+) -> PyResult<Vec<u8>> {
     if block.len() != 16 {
         return Err(PyValueError::new_err(
             "Kuznyechik operates on 16-byte blocks",
@@ -452,11 +472,15 @@ fn kuznyechik_encrypt_block(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
     }
     let c = Kuznyechik::new(&key)?;
     let blk: [u8; 16] = block.try_into().unwrap();
-    Ok(c.encrypt_block(&blk).to_vec())
+    py.allow_threads(|| Ok(c.encrypt_block(&blk).to_vec()))
 }
 
 #[pyfunction]
-fn kuznyechik_decrypt_block(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
+fn kuznyechik_decrypt_block(
+    py: Python<'_>,
+    key: Vec<u8>,
+    block: Vec<u8>,
+) -> PyResult<Vec<u8>> {
     if block.len() != 16 {
         return Err(PyValueError::new_err(
             "Kuznyechik operates on 16-byte blocks",
@@ -464,17 +488,27 @@ fn kuznyechik_decrypt_block(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
     }
     let c = Kuznyechik::new(&key)?;
     let blk: [u8; 16] = block.try_into().unwrap();
-    Ok(c.decrypt_block(&blk).to_vec())
+    py.allow_threads(|| Ok(c.decrypt_block(&blk).to_vec()))
 }
 
 #[pyfunction]
-fn ctr_encrypt(key: Vec<u8>, iv: Vec<u8>, plaintext: Vec<u8>) -> PyResult<Vec<u8>> {
-    ctr_keystream_xor(&key, &iv, &plaintext)
+fn ctr_encrypt(
+    py: Python<'_>,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    plaintext: Vec<u8>,
+) -> PyResult<Vec<u8>> {
+    py.allow_threads(|| ctr_keystream_xor(&key, &iv, &plaintext))
 }
 
 #[pyfunction]
-fn ctr_decrypt(key: Vec<u8>, iv: Vec<u8>, ciphertext: Vec<u8>) -> PyResult<Vec<u8>> {
-    ctr_keystream_xor(&key, &iv, &ciphertext)
+fn ctr_decrypt(
+    py: Python<'_>,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    ciphertext: Vec<u8>,
+) -> PyResult<Vec<u8>> {
+    py.allow_threads(|| ctr_keystream_xor(&key, &iv, &ciphertext))
 }
 
 #[pymodule]
@@ -529,7 +563,11 @@ mod timing {
 /// Raw constant-time Kuznyechik block (ANF S-box + matrix L). For hostile
 /// co-tenancy threat models; ~1000x slower than the table path.
 #[pyfunction]
-fn kuznyechik_encrypt_block_ct(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>> {
+fn kuznyechik_encrypt_block_ct(
+    py: Python<'_>,
+    key: Vec<u8>,
+    block: Vec<u8>,
+) -> PyResult<Vec<u8>> {
     if block.len() != 16 {
         return Err(PyValueError::new_err(
             "Kuznyechik operates on 16-byte blocks",
@@ -537,11 +575,13 @@ fn kuznyechik_encrypt_block_ct(key: Vec<u8>, block: Vec<u8>) -> PyResult<Vec<u8>
     }
     let c = Kuznyechik::new(&key)?;
     let blk: [u8; 16] = block.try_into().unwrap();
-    let mut t = blk;
-    for k in c.rk.iter().take(9) {
-        t = ct::lsx_ct(k, &t);
-    }
-    Ok(xor16(&c.rk[9], &t).to_vec())
+    py.allow_threads(|| {
+        let mut t = blk;
+        for k in c.rk.iter().take(9) {
+            t = ct::lsx_ct(k, &t);
+        }
+        Ok(xor16(&c.rk[9], &t).to_vec())
+    })
 }
 
 #[cfg(test)]

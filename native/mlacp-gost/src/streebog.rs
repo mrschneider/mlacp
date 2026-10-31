@@ -221,24 +221,32 @@ pub fn streebog_practical_core(message: &[u8], bits: usize) -> Result<Vec<u8>, P
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-#[pyfunction]
-#[pyo3(signature = (message, bits=256))]
-pub fn streebog(message: Vec<u8>, bits: usize) -> PyResult<Vec<u8>> {
-    streebog_core(&message, bits)
-}
-
-#[pyfunction]
-pub fn streebog_256(message: Vec<u8>) -> PyResult<Vec<u8>> {
-    streebog_core(&message, 256)
-}
-
-#[pyfunction]
-pub fn streebog_512(message: Vec<u8>) -> PyResult<Vec<u8>> {
-    streebog_core(&message, 512)
-}
+// The hash functions are CPU-bound: run them OUTSIDE the GIL so concurrent
+// connections (one thread each in the node) can hash in parallel. Inputs
+// are Vec<u8> copies taken before the release.
 
 #[pyfunction]
 #[pyo3(signature = (message, bits=256))]
-pub fn streebog_practical(message: Vec<u8>, bits: usize) -> PyResult<Vec<u8>> {
-    streebog_practical_core(&message, bits)
+pub fn streebog(py: Python<'_>, message: Vec<u8>, bits: usize) -> PyResult<Vec<u8>> {
+    py.allow_threads(|| streebog_core(&message, bits))
+}
+
+#[pyfunction]
+pub fn streebog_256(py: Python<'_>, message: Vec<u8>) -> PyResult<Vec<u8>> {
+    py.allow_threads(|| streebog_core(&message, 256))
+}
+
+#[pyfunction]
+pub fn streebog_512(py: Python<'_>, message: Vec<u8>) -> PyResult<Vec<u8>> {
+    py.allow_threads(|| streebog_core(&message, 512))
+}
+
+#[pyfunction]
+#[pyo3(signature = (message, bits=256))]
+pub fn streebog_practical(
+    py: Python<'_>,
+    message: Vec<u8>,
+    bits: usize,
+) -> PyResult<Vec<u8>> {
+    py.allow_threads(|| streebog_practical_core(&message, bits))
 }
