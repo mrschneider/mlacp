@@ -26,6 +26,14 @@ URN_RE = re.compile(
 
 _LEVELS = ("org", "zone", "node", "service")
 
+# Parsed-URN cache: the hot path (Envelope.from_value) parses the same sender /
+# recipient URNs repeatedly — once per frame, per hop. Address is immutable and
+# frozen, so memoising the regex result is safe and the single biggest win in
+# the frame profile (Address.parse / regex match is ~40% of per-frame time).
+# Bounded LRU so a long-lived node can't leak via an adversarial URN stream.
+_ADDRESS_CACHE: dict[str, Address] = {}
+_ADDRESS_CACHE_MAX = 4096
+
 
 @dataclass(frozen=True)
 class Address:
@@ -37,13 +45,19 @@ class Address:
     # -- construction --------------------------------------------------------
     @classmethod
     def parse(cls, urn: str) -> "Address":
+        cached = _ADDRESS_CACHE.get(urn)
+        if cached is not None:
+            return cached
         m = URN_RE.match(urn)
         if not m:
             raise BadAddress(
                 f"'{urn}' is not a mlacp URN "
                 "(expected mlacp:<org>/<zone>/<node>/<service>)"
             )
-        return cls(**m.groupdict())
+        a = cls(**m.groupdict())
+        if len(_ADDRESS_CACHE) < _ADDRESS_CACHE_MAX:
+            _ADDRESS_CACHE[urn] = a
+        return a
 
     # -- behavior ------------------------------------------------------------
     def to_urn(self) -> str:

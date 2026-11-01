@@ -66,3 +66,11 @@ def test_heard_center_survives_decay():
         g.management_tick()
         g.mark_heard("omsk")   # omsk keeps answering the management plane
     assert "omsk" in g.centers()
+
+
+def test_next_hop_direct_neighbour_is_self():
+    # The fast path: a direct neighbour must be returned as its own next hop
+    # without running the full route() path reconstruction.
+    g = grid()
+    assert g.next_hop("moskva", "omsk") == "omsk"
+    assert g.next_hop("omsk", "moskva") == "moskva"

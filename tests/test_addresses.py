@@ -28,3 +28,18 @@ def test_rejects_uppercase():
 def test_zone_widening_order():
     a = Address.parse("mlacp:ministry/transport/rail-ct/dispatch")
     assert a.widen_zones() == ["transport", "*"]
+
+
+def test_parse_is_cached_identity():
+    # The hot path parses the same URNs repeatedly; the cache must return the
+    # exact same frozen instance (identity, not just equality) for repeated
+    # parses of the same URN.
+    a1 = Address.parse("mlacp:ministry/transport/rail-ct/dispatch")
+    a2 = Address.parse("mlacp:ministry/transport/rail-ct/dispatch")
+    assert a1 is a2
+
+
+def test_parse_cache_does_not_break_validation():
+    # A malformed URN must still raise even though it never enters the cache.
+    with pytest.raises(BadAddress):
+        Address.parse("mlacp:ORG/zone/node/svc")

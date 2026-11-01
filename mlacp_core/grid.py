@@ -106,6 +106,12 @@ class CommunicationsGrid:
         return list(reversed(path))
 
     def next_hop(self, source: str, target: str) -> str:
+        # Fast path: if the target is a direct neighbour, we know the hop
+        # without running the full Dijkstra + path reconstruction that route()
+        # does (route builds AND reverses the whole list for a value we never
+        # use past the first element).
+        if target in self._links.get(source, {}):
+            return target
         path = self.route(source, target)
         return path[1] if len(path) > 1 else target
 

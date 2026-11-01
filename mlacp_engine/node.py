@@ -158,7 +158,9 @@ class CenterNode:
             # refusing by name beats forwarding into the void
             raise UnknownService(recipient.to_urn())
 
-        # layer 3: route through the grid toward the recipient's center
+        # layer 3: route through the grid toward the recipient's center.
+        # next_hop only — the full route() list is built and reversed for a
+        # value we never use past the first element.
         hop = self._route_toward(recipient)
 
         if recipient.to_urn() in self._conns:
