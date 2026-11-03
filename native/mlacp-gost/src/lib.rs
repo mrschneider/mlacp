@@ -10,6 +10,8 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 pub mod ct;
 mod sbox_anf;
@@ -137,6 +139,24 @@ fn lsx(k: &[u8; 16], a: &[u8; 16]) -> [u8; 16] {
     l_lin(&sub_s(&xor16(k, a)))
 }
 
+/// The 32 fixed key-schedule constants C_i = L(i), i=1..32 (RFC 7801 §4.3).
+/// Precomputed ONCE and shared by every cipher — the pure-Python path caches
+/// these as a class attribute (`Kuznyechik._CONSTANTS`); without this the Rust
+/// path rebuilt all 32 on every `Kuznyechik::new()` call via the slow 16-step
+/// `r_lin` loop, which was the dominant cost of the frame hot path.
+fn schedule_constants() -> &'static [[u8; 16]; 32] {
+    static C: std::sync::OnceLock<[[u8; 16]; 32]> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let mut constants = [[0u8; 16]; 32];
+        for i in 0u8..32 {
+            let mut blk = [0u8; 16];
+            blk[15] = i + 1;
+            constants[i as usize] = l_lin(&blk);
+        }
+        constants
+    })
+}
+
 /// Fused S∘L tables: T[p][b] = L(S(b) placed at byte p, zeros elsewhere).
 /// L(S(x)) = XOR over positions. Substitute ONLY the target byte (S(0) is
 /// PI[0], not zero — folding it in from the other positions was the bug
@@ -166,7 +186,20 @@ fn lsx_fast(k: &[u8; 16], a: &[u8; 16]) -> [u8; 16] {
     r.to_be_bytes()
 }
 
-/// Kuznyechik: 128-bit block, 256-bit key. Round keys precomputed once.
+/// Global cache of precomputed Kuznyechik key schedules, keyed by the raw key.
+///
+/// This is the fix for the asymmetry the pure-Python path never had: Python
+/// caches round keys via `Kuznyechik._RK_CACHE`, but the Rust path was
+/// rebuilding the 109µs key schedule on *every* `Kuznyechik::new()` call.
+/// Reading the schedule from this cache makes native on par with Python.
+fn cipher_cache() -> &'static Mutex<HashMap<[u8; 32], Kuznyechik>> {
+    static C: OnceLock<Mutex<HashMap<[u8; 32], Kuznyechik>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Kuznyechik: 128-bit block, 256-bit key. Round keys precomputed once and
+/// cached per key so repeated calls on the same key are allocation-free.
+#[derive(Clone)]
 struct Kuznyechik {
     rk: [[u8; 16]; 10],
 }
@@ -178,14 +211,18 @@ impl Kuznyechik {
                 "Kuznyechik key must be 32 bytes (V_256)",
             ));
         }
-        // the 32 key-schedule constants are fixed by the standard:
-        // C_i = L(i) with i as a 16-byte BIG-ENDIAN integer (RFC 7801 §4.3)
-        let mut constants = [[0u8; 16]; 32];
-        for i in 0u8..32 {
-            let mut blk = [0u8; 16];
-            blk[15] = i + 1;
-            constants[i as usize] = l_lin(&blk);
+        // Reuse a previously-built schedule for this key if present.
+        let key_arr: [u8; 32] = key.try_into().unwrap();
+        {
+            let cache = cipher_cache().lock().unwrap();
+            if let Some(cached) = cache.get(&key_arr) {
+                return Ok(cached.clone());
+            }
         }
+        // the 32 key-schedule constants are fixed by the standard:
+        // C_i = L(i) with i as a 16-byte BIG-ENDIAN integer (RFC 7801 §4.3).
+        // Read from the shared OnceLock instead of rebuilding per cipher.
+        let constants = schedule_constants();
         let mut keys = [[0u8; 16]; 10];
         keys[0] = key[..16].try_into().unwrap();
         keys[1] = key[16..].try_into().unwrap();
@@ -203,7 +240,12 @@ impl Kuznyechik {
             keys[k + 1] = b;
             k += 2;
         }
-        Ok(Kuznyechik { rk: keys })
+        let cipher = Kuznyechik { rk: keys };
+        cipher_cache()
+            .lock()
+            .unwrap()
+            .insert(key_arr, cipher.clone());
+        Ok(cipher)
     }
 
     fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
@@ -636,5 +678,34 @@ mod ct_tests {
             0xed, 0xcd,
         ];
         assert_eq!(ct, want, "CT path must reproduce RFC 7801 5.5");
+    }
+}
+
+#[cfg(test)]
+mod keysched_test {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn keysched_speed() {
+        let key = [7u8; 32];
+        // warm
+        let _ = Kuznyechik::new(&key).unwrap();
+        let t = Instant::now();
+        let n = 100_000;
+        for _ in 0..n {
+            std::hint::black_box(Kuznyechik::new(&key).unwrap());
+        }
+        println!("Kuznyechik::new: {:?} each", t.elapsed() / n);
+
+        // encrypt one block
+        let c = Kuznyechik::new(&key).unwrap();
+        let blk = [0x11u8; 16];
+        let _ = c.encrypt_block(&blk);
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(c.encrypt_block(std::hint::black_box(&blk)));
+        }
+        println!("encrypt_block (cached cipher): {:?} each", t.elapsed() / n);
     }
 }
