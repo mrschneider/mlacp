@@ -1170,6 +1170,24 @@ def gcm_acpkm_master_decrypt(key: bytes, icn: bytes, aad: bytes,
 # ---------------------------------------------------------------------------
 import os as _os
 
+_pure_secure_encrypt = secure_encrypt
+_pure_secure_decrypt = secure_decrypt
+
+
+class SecureContext:
+    """Portable context API; native contexts retain an expanded key schedule."""
+    def __init__(self, key: bytes):
+        if len(key) != 32:
+            raise ValueError("Kuznyechik key must be 32 bytes")
+        self._key = bytes(key)
+
+    def encrypt(self, iv: bytes, data: bytes) -> bytes:
+        return _pure_secure_encrypt(self._key, iv, data)
+
+    def decrypt(self, payload: bytes) -> bytes:
+        return _pure_secure_decrypt(self._key, payload)
+
+
 if not _os.environ.get("MLACP_PURE"):
     try:
         from mlacp_gost_rs import (  # type: ignore[import-not-found]
@@ -1194,3 +1212,9 @@ if not _os.environ.get("MLACP_PURE"):
         NATIVE_BACKEND = False
 else:
     NATIVE_BACKEND = False
+
+if NATIVE_BACKEND:
+    try:
+        from mlacp_gost_rs import SecureContext
+    except ImportError:
+        pass

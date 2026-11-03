@@ -13,8 +13,9 @@ from __future__ import annotations
 import base64
 import json
 import os
-import socket
 import threading
+import time
+from collections import OrderedDict, deque
 
 from mlacp_core.addresses import Address
 from mlacp_core.authority import CapabilityChain
@@ -28,7 +29,6 @@ from mlacp_core.errors import (
     UnknownService,
 )
 from mlacp_core.grid import CommunicationsGrid
-from mlacp_core.gost import secure_decrypt, secure_encrypt
 from mlacp_core.messages import (
     MAX_TTL,
     WIRE_KINDS,
@@ -48,11 +48,12 @@ class CenterNode:
                  directory: HierarchicalDirectory | None = None,
                  relay: CustodyRelay | None = None,
                  authority: CapabilityChain | None = None,
-                 link_key: bytes | None = None):
+                 link_key: bytes | None = None, *, journal_limit: int | None = 10_000,
+                 peer_capacity: int = 32, peer_idle_timeout: float = 10.0):
         self.urn = Address.parse(urn)
         self.grid = grid or CommunicationsGrid()
         self.directory = directory or HierarchicalDirectory()
-        self.relay = relay or CustodyRelay()
+        self.relay = relay if relay is not None else CustodyRelay()
         self.authority = authority or CapabilityChain()
         # the link keys, NEWEST FIRST is not the order: list[-1] is the
         # CURRENT epoch key; older epochs stay decryptable during the
@@ -60,7 +61,12 @@ class CenterNode:
         # key never protects NEW traffic (encrypt always uses list[-1])
         self.link_keys: list[bytes] = [link_key] if link_key else []
         self._epoch = 1 if link_key else 0
-        self.journal: list[dict] = []
+        if journal_limit is not None and journal_limit < 0:
+            raise ValueError("journal_limit must be non-negative or None")
+        self.journal = deque(maxlen=journal_limit)
+        self._crypto_contexts = OrderedDict()
+        from .channels import PeerConnectionPool
+        self._peer_pool = PeerConnectionPool(peer_capacity, peer_idle_timeout)
         self._lock = threading.Lock()
         self._conns: dict[str, object] = {}       # service urn -> channel-like
         self._contact_fn = None                   # grid hook: (center)->node|None
@@ -153,7 +159,7 @@ class CenterNode:
         # another center is that center's responsibility (§grid doctrine).
         if recipient.node == self.urn.node:
             self.directory.resolve(recipient.to_urn())
-        elif recipient.node not in self.grid.centers():
+        elif not self.grid.has_center(recipient.node):
             # nobody on this grid has ever heard of the recipient's center:
             # refusing by name beats forwarding into the void
             raise UnknownService(recipient.to_urn())
@@ -207,23 +213,36 @@ class CenterNode:
         return reply
 
     def _forward_to_center(self, center: str, forwarded: dict) -> dict:
-        import socket as _socket
         if center not in self.peers:
             raise InfrastructureFailure("unavailable", f"no link to center '{center}'", True)
-        host, port = self.peers[center]
         try:
-            sock = _socket.create_connection((host, port), timeout=5)
-        except OSError as e:
-            raise InfrastructureFailure("unavailable", f"center '{center}' silent: {e}", True)
-        chan = TcpChannel(sock)
-        try:
-            _chan_send(chan, forwarded)
-            reply = _recv_frame(chan, timeout=5)
-        finally:
-            chan.close()
-        if reply is None:
-            raise InfrastructureFailure("timeout", f"center '{center}' did not answer", True)
-        return reply
+            with self._peer_pool.connection(center, self.peers[center]) as chan:
+                _chan_send(chan, forwarded)
+                reply = _recv_frame(chan, timeout=5)
+                if reply is None:
+                    raise InfrastructureFailure("timeout", f"center '{center}' did not answer", True)
+                return reply
+        except (OSError, ValueError) as error:
+            raise InfrastructureFailure("unavailable", f"center '{center}' exchange failed: {error}", True) from error
+
+    def close(self):
+        """Release pooled outbound transports when this center is stopped."""
+        self._peer_pool.close()
+
+    def _crypto_context(self, key):
+        from mlacp_core.gost import SecureContext
+        with self._lock:
+            context = self._crypto_contexts.get(key)
+            if context is None:
+                context = SecureContext(key)
+                if key not in self.link_keys:
+                    return context  # an in-flight old epoch is not retained again
+                self._crypto_contexts[key] = context
+                while len(self._crypto_contexts) > 3:
+                    self._crypto_contexts.popitem(last=False)
+            else:
+                self._crypto_contexts.move_to_end(key)
+            return context
 
     def _route_toward(self, recipient: Address) -> str | None:
         """Next grid hop toward the recipient's node, or None when this node
@@ -294,7 +313,7 @@ class CenterNode:
         iv = bytearray(os.urandom(16))
         iv[0] &= 0x7F  # MGM reserves the top bit of the ICN
         # ALWAYS the current-epoch key: the old key never protects new traffic
-        payload = secure_encrypt(self.link_keys[-1], bytes(iv), raw)
+        payload = self._crypto_context(self.link_keys[-1]).encrypt(bytes(iv), raw)
         return {"__secure__": True,
                 "payload": base64.b64encode(payload).decode()}
 
@@ -310,7 +329,7 @@ class CenterNode:
         last_err: Exception | None = None
         for key in reversed(self.link_keys):
             try:
-                return json.loads(secure_decrypt(key, payload))
+                return json.loads(self._crypto_context(key).decrypt(payload))
             except ValueError as e:
                 last_err = e
         raise BusinessRefusal(
@@ -345,11 +364,15 @@ class CenterNode:
 
     def _adopt_link_key(self, kek: bytes, epoch: int, role: str,
                         curve_name: str, ukm: int) -> None:
-        if epoch <= self._epoch and kek in self.link_keys:
-            return  # replayed/retransmitted accept for a known epoch
-        self.link_keys.append(kek)
-        self.link_keys = self.link_keys[-3:]  # the re-key window
-        self._epoch = max(self._epoch, epoch)
+        with self._lock:
+            if epoch <= self._epoch and kek in self.link_keys:
+                return
+            self.link_keys.append(kek)
+            self.link_keys = self.link_keys[-3:]
+            self._epoch = max(self._epoch, epoch)
+            for key in list(self._crypto_contexts):
+                if key not in self.link_keys:
+                    del self._crypto_contexts[key]
         self._jour("handshake_complete", role=role, epoch=epoch,
                    curve=curve_name, ukm=ukm)
 
@@ -404,50 +427,88 @@ def _chan_send(chan, wire_frame: dict) -> None:
 
 def _recv_frame(chan, timeout: float | None = None) -> dict | None:
     """Read one JSON-line frame from a channel (buffers across recv calls)."""
-    buf = getattr(chan, "_mlacp_buf", b"")
-    deadline = None
+    buf = bytearray(getattr(chan, "_mlacp_buf", b""))
+    deadline = None if timeout is None else time.monotonic() + timeout
     while b"\n" not in buf:
-        chunk = chan.recv(timeout)
-        if chunk is None:
+        remaining = None if deadline is None else max(0, deadline - time.monotonic())
+        if remaining == 0:
+            chan._mlacp_buf = bytes(buf)
             return None
-        buf += chunk
+        chunk = chan.recv(remaining)
+        if chunk is None:
+            chan._mlacp_buf = bytes(buf)
+            return None
+        buf.extend(chunk)
+        if len(buf) > 4 * 1024 * 1024:
+            raise ValueError("MLACP JSON frame exceeds 4 MiB")
     line, _, rest = buf.partition(b"\n")
-    chan._mlacp_buf = rest
-    return json.loads(line.decode())
+    chan._mlacp_buf = bytes(rest)
+    return json.loads(line)
 
 
-def serve(node: CenterNode, listener, run_flag: threading.Event) -> threading.Thread:
-    """Accept connections on the primary network and serve frames until
-    ``run_flag`` is set."""
+def serve(node: CenterNode, listener, run_flag: threading.Event, *,
+          max_connections: int = 64, idle_timeout: float = 30.0) -> threading.Thread:
+    """Bound connection workers; stop closes accepted and outbound channels."""
+    if max_connections < 1 or idle_timeout <= 0:
+        raise ValueError("connection limit and idle timeout must be positive")
+    gate = threading.BoundedSemaphore(max_connections)
+    lock = threading.Lock()
+    workers = {}
+
+    def run_connection(chan):
+        try:
+            _serve_conn(node, chan, run_flag, idle_timeout)
+        finally:
+            with lock:
+                workers.pop(threading.current_thread(), None)
+            gate.release()
 
     def loop():
-        while not run_flag.is_set():
-            chan = listener.accept(timeout=0.2)
-            if chan is None:
-                continue
-            t = threading.Thread(target=_serve_conn, args=(node, chan),
-                                 daemon=True)
-            t.start()
+        try:
+            while not run_flag.is_set():
+                node._peer_pool.close_idle()
+                try:
+                    chan = listener.accept(timeout=0.2)
+                except OSError:
+                    break
+                if chan is None:
+                    continue
+                if not gate.acquire(blocking=False):
+                    chan.close()
+                    continue
+                worker = threading.Thread(target=run_connection, args=(chan,), daemon=True)
+                with lock:
+                    workers[worker] = chan
+                worker.start()
+        finally:
+            with lock:
+                active = list(workers.items())
+            for _, chan in active:
+                chan.close()
+            node.close()
+            for worker, _ in active:
+                worker.join(timeout=1)
 
     th = threading.Thread(target=loop, daemon=True)
     th.start()
     return th
 
 
-def _serve_conn(node: CenterNode, chan) -> None:
+def _serve_conn(node: CenterNode, chan, run_flag=None, idle_timeout=30.0) -> None:
+    last_used = time.monotonic()
     try:
-        while True:
-            f = _recv_frame(chan, timeout=0.5)
+        while run_flag is None or not run_flag.is_set():
+            f = _recv_frame(chan, timeout=0.2)
             if f is None:
-                break
+                if getattr(chan, 'eof', False) or time.monotonic() - last_used >= idle_timeout:
+                    break
+                continue
+            last_used = time.monotonic()
             reply = node.handle_frame(f, conn=chan)
             if reply is not None:
-                try:
-                    _chan_send(chan, reply)
-                except OSError:
-                    break  # the peer hung up mid-reply: not an error
-        node.handle_frame(frame("close"), conn=chan)
-    except OSError:
-        pass  # a dying connection is the peer's business, not a crash
+                _chan_send(chan, reply)
+    except (OSError, ValueError):
+        pass
     finally:
+        node.handle_frame(frame("close"), conn=chan)
         chan.close()

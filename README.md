@@ -205,3 +205,62 @@ docs/           research (with sources), architecture, requirements
 .github/        CI (fmt/clippy/tests/E2E + native crate gate) and the
                 release pipeline (test gate + 6-platform wheel matrix)
 ```
+
+## Performance and resource controls
+
+Authority validation uses a holder index; iterative cascading revocation visits
+only descendants and retains deterministic history order. Directory zone widening
+uses an ordered `(organization, node, service)` index, preserving exact-zone
+precedence and registration order. Custody contact looks up only its addressee,
+with sequence-ordered release and acknowledgement-based retention unchanged.
+Advance custody TTLs through `age_one_window()`. Use registration/delegation and
+custody APIs to change indexed state; do not mutate identity/address metadata or
+private backing dictionaries directly. Compound index updates are synchronized
+for the reference engine's connection threads.
+
+Grid routing uses heap-based Dijkstra with non-negative integer costs. Both
+`route()` and `next_hop()` honor weighted shortest paths, including when a direct
+neighbor is more expensive than a multi-hop path. Updates and management decay
+are reflected immediately; no stale route cache is retained.
+
+`CenterNode(..., journal_limit=10000)` and
+`CapabilityChain(history_limit=10000)` retain bounded event suffixes by default.
+A limit of zero disables retention; `None` explicitly retains all events. These
+are in-memory histories, not durable audit logs. Live grants, revocation decisions,
+and custody state are independent of event-history retention.
+
+Outbound peers use a bounded connection pool (`peer_capacity=32`,
+`peer_idle_timeout=10.0`). Exchanges on each connection are serialized because the
+protocol has no general request/response multiplexing identifier. Idle transports
+are retired on pool activity or the serving loop's periodic checks; idle entries
+can be evicted to make room, while a fully busy pool refuses new peers. Errors
+invalidate the affected connection. **An ambiguous failed exchange is never
+retried automatically**: the peer may already have accepted custody. The next
+explicit call reconnects. Changed peer endpoints use separate transports.
+
+`serve(node, listener, stop, max_connections=64, idle_timeout=30.0)` bounds accepted
+connection workers and closes excess connections immediately. Shutdown closes
+accepted and pooled transports and waits briefly for workers. Call `node.close()`
+when using outbound forwarding without `serve()`. Keep the client pool idle
+retirement shorter than the peer server's idle timeout. Framing retains partial
+reads across timeouts, uses a total receive deadline, and bounds JSON lines at
+4 MiB. Channel writes are serialized to prevent interleaved frames.
+
+The native `gost.SecureContext(key)` retains an expanded Kuznyechik schedule;
+`encrypt(iv, data)` and `decrypt(payload)` preserve secure-frame bytes and tag
+validation. Nodes retain contexts only for their current three-epoch key window.
+Each encryption still generates a fresh MGM IV. Only public key-schedule constants
+are global; there is no process-global cache of secret keys. Native calls continue
+releasing the GIL. Older wheels and `MLACP_PURE=1` retain a compatible Python
+context API; rebuild the native wheel to obtain schedule reuse.
+
+The corrected benchmark runs the requested number of iterations, separates
+steady-state timing from warmup, uses valid symmetric VKO agreements, and verifies
+successful deliveries instead of timing error replies:
+
+```sh
+python experiments/bench.py --iterations 20 --node-frames 2000
+MLACP_PURE=1 python experiments/bench.py --iterations 1 --node-frames 100
+```
+
+Local measurements and their limits are recorded in [docs/benchmarks.md](docs/benchmarks.md).

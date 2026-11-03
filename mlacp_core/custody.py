@@ -11,6 +11,8 @@ relay never inspects a bundle body.
 from __future__ import annotations
 
 import itertools
+import threading
+from ._locking import locked
 from dataclasses import dataclass, field
 
 from .errors import BusinessRefusal
@@ -39,17 +41,41 @@ class CustodyRelay:
     _pending: dict[str, Release] = field(default_factory=dict)  # released, unacked
     _next: dict[str, int] = field(default_factory=dict)      # addressee -> next seq
     _counter = itertools.count()
+    _by_addressee: dict = field(default_factory=dict, init=False, repr=False)
+    _expired_ids: set = field(default_factory=set, init=False, repr=False)
+    _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
+
+    def __post_init__(self):
+        for bundle in self._held.values():
+            self._index(bundle)
+
+    def _index(self, bundle):
+        self._by_addressee.setdefault(bundle.addressee, {})[bundle.bundle_id] = bundle
+        if bundle.ttl <= 0:
+            self._expired_ids.add(bundle.bundle_id)
+
+    def _remove_held(self, bid):
+        bundle = self._held.pop(bid)
+        bucket = self._by_addressee[bundle.addressee]
+        del bucket[bid]
+        if not bucket:
+            del self._by_addressee[bundle.addressee]
+        self._expired_ids.discard(bid)
+        return bundle
 
     # -- taking custody -------------------------------------------------------
+    @locked
     def accept(self, bundle: Bundle) -> str:
+        if bundle.bundle_id in self._held or bundle.bundle_id in self._pending:
+            return bundle.bundle_id
         if len(self._held) + len(self._pending) >= self.capacity:
             raise BusinessRefusal("relay onboard memory full — custody refused")
-        if bundle.bundle_id in self._held or bundle.bundle_id in self._pending:
-            return bundle.bundle_id  # idempotent re-upload (station retransmit)
         self._held[bundle.bundle_id] = bundle
+        self._index(bundle)
         return bundle.bundle_id
 
     # -- contact windows ------------------------------------------------------
+    @locked
     def contact(self, addressee_urn: str) -> list[Bundle]:
         """The addressee is on the air: release its held bundles IN SEQ ORDER
         (the Strela dump discipline). Each release becomes pending until its
@@ -57,16 +83,20 @@ class CustodyRelay:
         expiry is journaled by the engine, not silently."""
         self._expire()
         ready = sorted(
-            (b for b in self._held.values() if b.addressee == addressee_urn),
+            self._by_addressee.get(addressee_urn, {}).values(),
             key=lambda b: b.seq,
         )
         out = []
         for b in ready:
-            del self._held[b.bundle_id]
+            if b.ttl <= 0:
+                self._remove_held(b.bundle_id)
+                continue
+            self._remove_held(b.bundle_id)
             self._pending[b.bundle_id] = Release(b)
             out.append(b)
         return out
 
+    @locked
     def acknowledge(self, bundle_id: str) -> None:
         """The custody ack: the relay's copy is released."""
         if bundle_id not in self._pending:
@@ -74,6 +104,7 @@ class CustodyRelay:
         del self._pending[bundle_id]
 
     # -- time passes ----------------------------------------------------------
+    @locked
     def age_one_window(self) -> list[str]:
         """One contact window passes: decrement every held TTL, return the
         ids of bundles that expired (the caller journals them)."""
@@ -81,23 +112,30 @@ class CustodyRelay:
         for b in list(self._held.values()):
             b.ttl -= 1
             if b.ttl <= 0:
-                del self._held[b.bundle_id]
+                self._remove_held(b.bundle_id)
                 expired.append(b.bundle_id)
         return expired
 
     def _expire(self) -> None:
-        for b in [b for b in self._held.values() if b.ttl <= 0]:
-            del self._held[b.bundle_id]
+        for bid in list(self._expired_ids):
+            bundle = self._held.get(bid)
+            if bundle is not None and bundle.ttl <= 0:
+                self._remove_held(bid)
+            else:
+                self._expired_ids.discard(bid)
 
     # -- inspection -----------------------------------------------------------
+    @locked
     def held_for(self, addressee_urn: str) -> list[Bundle]:
         return sorted(
-            (b for b in self._held.values() if b.addressee == addressee_urn),
+            self._by_addressee.get(addressee_urn, {}).values(),
             key=lambda b: b.seq,
         )
 
+    @locked
     def pending_acks(self) -> list[str]:
         return sorted(self._pending)
 
+    @locked
     def __len__(self) -> int:
         return len(self._held) + len(self._pending)

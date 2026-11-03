@@ -180,12 +180,16 @@ impl Kuznyechik {
         }
         // the 32 key-schedule constants are fixed by the standard:
         // C_i = L(i) with i as a 16-byte BIG-ENDIAN integer (RFC 7801 §4.3)
-        let mut constants = [[0u8; 16]; 32];
-        for i in 0u8..32 {
-            let mut blk = [0u8; 16];
-            blk[15] = i + 1;
-            constants[i as usize] = l_lin(&blk);
-        }
+        static CONSTANTS: std::sync::OnceLock<[[u8; 16]; 32]> = std::sync::OnceLock::new();
+        let constants = CONSTANTS.get_or_init(|| {
+            let mut constants = [[0u8; 16]; 32];
+            for i in 0u8..32 {
+                let mut blk = [0u8; 16];
+                blk[15] = i + 1;
+                constants[i as usize] = l_lin(&blk);
+            }
+            constants
+        });
         let mut keys = [[0u8; 16]; 10];
         keys[0] = key[..16].try_into().unwrap();
         keys[1] = key[16..].try_into().unwrap();
@@ -337,8 +341,19 @@ fn mgm_tag(cipher: &Kuznyechik, icn: &[u8; 16], aad: &[u8], ct: &[u8], tag_len: 
     cipher.encrypt_block(&total.to_be_bytes())[..tag_len].to_vec()
 }
 
+#[cfg(test)]
 fn mgm_encrypt(
     key: &[u8],
+    icn: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+    tag_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>), PyErr> {
+    mgm_encrypt_prepared(&Kuznyechik::new(key)?, icn, aad, plaintext, tag_len)
+}
+
+fn mgm_encrypt_prepared(
+    cipher: &Kuznyechik,
     icn: &[u8],
     aad: &[u8],
     plaintext: &[u8],
@@ -354,7 +369,6 @@ fn mgm_encrypt(
             "MGM tag length must be 1..16 bytes (RFC 9058 §5.3)",
         ));
     }
-    let cipher = Kuznyechik::new(key)?;
     let mut y = cipher.encrypt_block(icn.try_into().unwrap());
     let mut ct = Vec::with_capacity(plaintext.len());
     for block in plaintext.chunks(16) {
@@ -364,7 +378,7 @@ fn mgm_encrypt(
         }
         incr_r(&mut y);
     }
-    let tag = mgm_tag(&cipher, icn.try_into().unwrap(), aad, &ct, tag_len);
+    let tag = mgm_tag(cipher, icn.try_into().unwrap(), aad, &ct, tag_len);
     Ok((ct, tag))
 }
 
@@ -401,21 +415,16 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // are Vec<u8> copies made BEFORE the release, so the closure holds no
 // Python references.
 
-#[pyfunction]
-#[pyo3(signature = (key, iv, data))]
-fn secure_encrypt(py: Python<'_>, key: Vec<u8>, iv: Vec<u8>, data: Vec<u8>) -> PyResult<Vec<u8>> {
-    py.detach(|| {
-        let (ct, tag) = mgm_encrypt(&key, &iv, MGM_AAD, &data, 16)?;
-        let mut out = Vec::with_capacity(16 + ct.len() + 16);
-        out.extend_from_slice(&iv);
-        out.extend_from_slice(&ct);
-        out.extend_from_slice(&tag);
-        Ok(out)
-    })
+fn secure_encrypt_prepared(cipher: &Kuznyechik, iv: &[u8], data: &[u8]) -> PyResult<Vec<u8>> {
+    let (ct, tag) = mgm_encrypt_prepared(cipher, iv, MGM_AAD, data, 16)?;
+    let mut out = Vec::with_capacity(16 + ct.len() + 16);
+    out.extend_from_slice(iv);
+    out.extend_from_slice(&ct);
+    out.extend_from_slice(&tag);
+    Ok(out)
 }
 
-#[pyfunction]
-fn secure_decrypt(py: Python<'_>, key: Vec<u8>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
+fn secure_decrypt_prepared(cipher: &Kuznyechik, payload: &[u8]) -> PyResult<Vec<u8>> {
     if payload.len() < 32 {
         return Err(PyValueError::new_err(
             "secure frame too short — iv(16) || ct || tag(16)",
@@ -429,26 +438,59 @@ fn secure_decrypt(py: Python<'_>, key: Vec<u8>, payload: Vec<u8>) -> PyResult<Ve
             "MGM ICN must be 16 bytes with the top bit zero",
         ));
     }
-    py.detach(|| {
-        let cipher = Kuznyechik::new(&key)?;
-        let mut y = cipher.encrypt_block(icn.try_into().unwrap());
-        let mut pt = Vec::with_capacity(ct.len());
-        for block in ct.chunks(16) {
-            let ks = cipher.encrypt_block(&y);
-            // the MGM keystream is symmetric: plaintext = ct XOR keystream
-            for (i, &b) in block.iter().enumerate() {
-                pt.push(b ^ ks[i]);
-            }
-            incr_r(&mut y);
+    let expected = mgm_tag(cipher, icn.try_into().unwrap(), MGM_AAD, ct, 16);
+    if !ct_eq(&expected, tag) {
+        return Err(PyValueError::new_err(
+            "MGM tag verification failed — frame altered in transit",
+        ));
+    }
+    let mut y = cipher.encrypt_block(icn.try_into().unwrap());
+    let mut pt = Vec::with_capacity(ct.len());
+    for block in ct.chunks(16) {
+        let ks = cipher.encrypt_block(&y);
+        for (i, &b) in block.iter().enumerate() {
+            pt.push(b ^ ks[i]);
         }
-        let expected = mgm_tag(&cipher, icn.try_into().unwrap(), MGM_AAD, ct, tag.len());
-        if !ct_eq(&expected, tag) {
-            return Err(PyValueError::new_err(
-                "MGM tag verification failed — frame altered in transit",
-            ));
-        }
-        Ok(pt)
-    })
+        incr_r(&mut y);
+    }
+    Ok(pt)
+}
+
+/// An explicitly owned key schedule; no process-global secret-key cache.
+#[pyclass(frozen)]
+struct SecureContext {
+    cipher: Kuznyechik,
+}
+
+#[pymethods]
+impl SecureContext {
+    #[new]
+    fn new(py: Python<'_>, key: Vec<u8>) -> PyResult<Self> {
+        py.detach(|| {
+            Ok(Self {
+                cipher: Kuznyechik::new(&key)?,
+            })
+        })
+    }
+
+    fn encrypt(&self, py: Python<'_>, iv: Vec<u8>, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        py.detach(|| secure_encrypt_prepared(&self.cipher, &iv, &data))
+    }
+
+    fn decrypt(&self, py: Python<'_>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
+        py.detach(|| secure_decrypt_prepared(&self.cipher, &payload))
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (key, iv, data))]
+fn secure_encrypt(py: Python<'_>, key: Vec<u8>, iv: Vec<u8>, data: Vec<u8>) -> PyResult<Vec<u8>> {
+    py.detach(|| secure_encrypt_prepared(&Kuznyechik::new(&key)?, &iv, &data))
+}
+
+#[pyfunction]
+fn secure_decrypt(py: Python<'_>, key: Vec<u8>, payload: Vec<u8>) -> PyResult<Vec<u8>> {
+    py.detach(|| secure_decrypt_prepared(&Kuznyechik::new(&key)?, &payload))
 }
 
 /// Raw Kuznyechik block primitive (exposed for tests and future modes —
@@ -494,6 +536,7 @@ fn ctr_decrypt(
 
 #[pymodule]
 fn mlacp_gost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<SecureContext>()?;
     m.add_function(wrap_pyfunction!(secure_encrypt, m)?)?;
     m.add_function(wrap_pyfunction!(secure_decrypt, m)?)?;
     m.add_function(wrap_pyfunction!(streebog::streebog, m)?)?;

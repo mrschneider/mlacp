@@ -12,6 +12,10 @@ bypass damaged arteries). Routing principles ported from the doctrine:
 
 from __future__ import annotations
 
+import heapq
+import threading
+from collections import deque
+from ._locking import locked
 from dataclasses import dataclass, field
 
 from .errors import BusinessRefusal
@@ -39,12 +43,17 @@ class CommunicationsGrid:
     _links: dict[str, dict[str, Link]] = field(default_factory=dict)
     _heard: dict[str, int] = field(default_factory=dict)
     _tick: int = 0
+    _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
 
     # -- building the grid -----------------------------------------------------
+    @locked
     def add_center(self, center: str) -> None:
         self._links.setdefault(center, {})
 
+    @locked
     def add_link(self, a: str, b: str, kind: str = "arterial", cost: int = 1) -> None:
+        if not isinstance(cost, int) or cost < 0:
+            raise BusinessRefusal("link cost must be a non-negative integer")
         if kind not in ("arterial", "lateral"):
             raise BusinessRefusal(f"link kind must be arterial|lateral, got '{kind}'")
         self.add_center(a)
@@ -52,10 +61,12 @@ class CommunicationsGrid:
         self._links[a][b] = Link(b, kind, cost)
         self._links[b][a] = Link(a, kind, cost)
 
+    @locked
     def mark_heard(self, center: str) -> None:
         self._heard[center] = self._tick
 
     # -- the management tick (autonomy) ---------------------------------------
+    @locked
     def management_tick(self) -> list[str]:
         """One management tick: advance, decay freshness on every link to a
         center not heard from, and drop centers gone silent. Returns the
@@ -73,6 +84,7 @@ class CommunicationsGrid:
         return removed
 
     # -- routing ---------------------------------------------------------------
+    @locked
     def route(self, source: str, target: str) -> list[str]:
         """Dijkstra over the surviving links. Ties prefer arterials (lower
         cost). Returns the center path INCLUDING both endpoints; raises
@@ -84,40 +96,44 @@ class CommunicationsGrid:
         dist = {source: 0}
         prev: dict[str, str | None] = {source: None}
         visited: set[str] = set()
-        while True:
-            pending = {c: d for c, d in dist.items() if c not in visited}
-            if not pending:
-                raise NoRoute(target)
-            current = min(pending, key=lambda c: (pending[c], c))
+        pending = [(0, source)]
+        while pending:
+            distance, current = heapq.heappop(pending)
+            if current in visited or distance != dist[current]:
+                continue
             if current == target:
                 break
             visited.add(current)
             for link in self._links.get(current, {}).values():
                 if link.to_center in visited:
                     continue
-                nd = dist[current] + link.cost
-                if nd < dist.get(link.to_center, 1 << 30):
+                nd = distance + link.cost
+                if nd < dist.get(link.to_center, float("inf")):
                     dist[link.to_center] = nd
                     prev[link.to_center] = current
+                    heapq.heappush(pending, (nd, link.to_center))
+        else:
+            raise NoRoute(target)
         path, node = [], target
         while node is not None:
             path.append(node)
             node = prev[node]
         return list(reversed(path))
 
+    @locked
     def next_hop(self, source: str, target: str) -> str:
-        # Fast path: if the target is a direct neighbour, we know the hop
-        # without running the full Dijkstra + path reconstruction that route()
-        # does (route builds AND reverses the whole list for a value we never
-        # use past the first element).
-        if target in self._links.get(source, {}):
-            return target
         path = self.route(source, target)
         return path[1] if len(path) > 1 else target
 
+    @locked
+    def has_center(self, center: str) -> bool:
+        return center in self._links
+
+    @locked
     def centers(self) -> list[str]:
         return sorted(self._links)
 
+    @locked
     def route_diversity(self, a: str, b: str) -> int:
         """How many edge-disjoint arterial routes survive between two centers
         (the doctrine's route-diversity metric, computed by max-flow)."""
@@ -132,9 +148,9 @@ class CommunicationsGrid:
         while True:
             # BFS in the residual graph
             parent: dict[str, str | None] = {s: None}
-            queue = [s]
+            queue = deque([s])
             while queue and t not in parent:
-                u = queue.pop(0)
+                u = queue.popleft()
                 for v, c in cap.get(u, {}).items():
                     if c > 0 and v not in parent:
                         parent[v] = u
