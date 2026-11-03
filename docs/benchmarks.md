@@ -18,7 +18,8 @@ TCP connection for each request took median 465 µs and accepted 50 connections;
 the pool took median 43 µs and accepted one connection. Exchanges were sequential,
 not multiplexed, and all resources were closed at the end.
 
-After public-constant precomputation, a repeated 2 KB native encryption workload
+Before integrating the separately published v0.2.10 stateless schedule cache,
+a repeated 2 KB native encryption workload
 measured 125 µs through the stateless function versus 65 µs with an explicit
 SecureContext. Decryption measured 132 µs versus 73 µs. These compare the two
 current APIs on the same data and exclude context construction from per-message
@@ -36,3 +37,14 @@ counted 128 unknown-service replies and 1,872 quota refusals as 2,000 processed
 messages, and crypto timing executed once while dividing by 200. New timing uses
 three repeated runs, real iteration counts, warmed tables, precomputed decryption
 inputs, and a valid two-party VKO exchange whose derived keys must match.
+
+
+The release also incorporates the newer v0.2.10 stateless key-schedule cache.
+Its reuse is retained with a 64-key FIFO bound; explicit contexts bypass the
+process-global cache. Consequently the stateless/context timing comparison above
+describes the earlier implementation stage, not the final merged release.
+
+The final merged local run measured stateless/context 2 KB encryption at about
+66/79 µs and decryption at 66/64 µs. Small-run scheduling variation is visible;
+contexts are intended for explicit key lifetime and bounded node ownership, not
+a promised speedup over v0.2.10's warmed stateless cache.

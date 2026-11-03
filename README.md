@@ -249,8 +249,9 @@ reads across timeouts, uses a total receive deadline, and bounds JSON lines at
 The native `gost.SecureContext(key)` retains an expanded Kuznyechik schedule;
 `encrypt(iv, data)` and `decrypt(payload)` preserve secure-frame bytes and tag
 validation. Nodes retain contexts only for their current three-epoch key window.
-Each encryption still generates a fresh MGM IV. Only public key-schedule constants
-are global; there is no process-global cache of secret keys. Native calls continue
+Nodes generate a fresh MGM IV for each encryption. Public key-schedule constants are shared globally. The stateless API retains
+v0.2.10 schedule reuse through a process-wide FIFO cache bounded to 64 keys;
+explicit contexts bypass that cache, so node keys follow their epoch lifetime. Native calls continue
 releasing the GIL. Older wheels and `MLACP_PURE=1` retain a compatible Python
 context API; rebuild the native wheel to obtain schedule reuse.
 
