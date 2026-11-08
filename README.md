@@ -155,6 +155,25 @@ These are local measurements for specific workloads, not production capacity
 guarantees. The [benchmark report](docs/benchmarks.md) describes methodology,
 limitations, and the corrected harness.
 
+A native-backend run of the same harness on the v0.3.1 tree
+(`c3b23b8`, Rust MGM/Streebog with the RFC 6072-2 tag fix) produced:
+
+| Workload | v0.3.1 (native) |
+|---|---:|
+| `secure_encrypt` 2 KB | 173 µs/call |
+| `context.encrypt` 2 KB | 172 µs/call |
+| `secure_decrypt` 2 KB | 173 µs/call |
+| `context.decrypt` 2 KB | 187 µs/call |
+| `ctr_encrypt` 2 KB | 28.6 µs/call |
+| `streebog_256` 64 KB | 15.75 ms/call |
+| `streebog_512` 64 KB | 16.07 ms/call |
+| VKO-512 symmetric agreement (two-party) | 67.9 ms/call |
+| Loopback exchange, 2,000 envelopes | 21.9 µs/frame (≈45,600 frames/s) |
+
+Each crypto row is three runs of 20 timed calls; the envelope row verifies
+2,000/2,000 deliveries. Values are single-machine local measurements, not
+capacity guarantees, and the VKO row includes both peer operations.
+
 ```sh
 python experiments/bench.py --iterations 20 --node-frames 2000
 ```
