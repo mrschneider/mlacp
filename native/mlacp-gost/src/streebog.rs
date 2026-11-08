@@ -82,9 +82,9 @@ fn xor64(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
 fn g(h: &[u8; 64], n: &[u8; 64], m: &[u8; 64]) -> [u8; 64] {
     let mut ks = [[0u8; 64]; 13];
     ks[0] = lps(&xor64(h, n));
+    let consts = c_constants();
     for i in 0..12 {
-        let c = hex64(STREEBOG_C[i]);
-        ks[i + 1] = lps(&xor64(&ks[i], &c));
+        ks[i + 1] = lps(&xor64(&ks[i], &consts[i]));
     }
     let mut t = *m;
     for k in ks[..12].iter() {
@@ -99,6 +99,19 @@ fn hex64(hex: &str) -> [u8; 64] {
         out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
     }
     out
+}
+
+/// The 12 round constants, parsed ONCE (they used to be re-parsed from hex on
+/// every 64-byte block — ~12,000 redundant hex decodes for a 64 KB digest).
+fn c_constants() -> &'static [[u8; 64]; 12] {
+    static C: std::sync::OnceLock<[[u8; 64]; 12]> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let mut out = [[0u8; 64]; 12];
+        for (i, h) in STREEBOG_C.iter().enumerate() {
+            out[i] = hex64(h);
+        }
+        out
+    })
 }
 
 /// RFC 6986 "mathematical" convention: the RIGHTMOST 512-bit block is

@@ -334,14 +334,69 @@ fn mgm_dbl(x: u128) -> u128 {
     }
 }
 
-fn mgm_mul(x: u128, y: u128) -> u128 {
-    let mut r = 0u128;
-    let mut a = x;
-    for i in 0..128 {
-        if (y >> i) & 1 != 0 {
-            r ^= a;
+// Byte tables for the LEFT operand of a GF(2^128) multiply:
+// byte_tbls(x)[b][v] = (x * 2^(8b)) * v, for big-endian byte position b.
+// A full multiply is then 16 lookups + 15 XORs (vs the old 128-iteration
+// bit loop). The table is built with 16 doublings + a small lowbit fold and
+// is bit-for-bit identical to repeated mgm_dbl, so the tag is unchanged.
+fn mgm_byte_tbls(x: u128) -> [[u128; 256]; 16] {
+    let mut t = [[0u128; 256]; 16];
+    let mut base = x; // base == x * 2^(8b) at iteration b
+    for b in 0..16 {
+        t[b][0] = 0;
+        t[b][1] = base;
+        for k in 1..8 {
+            t[b][1 << k] = mgm_dbl(t[b][1 << (k - 1)]);
         }
-        a = mgm_dbl(a);
+        for v in 2..256 {
+            let lb = v & (!v + 1);
+            t[b][v] = t[b][v & (v - 1)] ^ t[b][lb];
+        }
+        // advance base by one BYTE (8 doublings) so t[b] is x*2^(8b); a single
+        // doubling here left base at x*2^b and corrupted every t[b] for b>0.
+        for _ in 0..8 {
+            base = mgm_dbl(base);
+        }
+    }
+    t
+}
+
+fn mgm_mul_with(tx: &[[u128; 256]; 16], y: u128) -> u128 {
+    // tx[b] == x * 2^(8b). The big-endian byte yb[b] sits at bit offset
+    // 8*(15-b) of y, so pair it with tx[15-b] (not tx[b], which would
+    // compute x * byte_reverse(y)).
+    let yb = y.to_be_bytes();
+    let mut r = 0u128;
+    for b in 0..16 {
+        r ^= tx[15 - b][yb[b] as usize];
+    }
+    r
+}
+
+fn mgm_mul(x: u128, y: u128) -> u128 {
+    mgm_mul_with(&mgm_byte_tbls(x), y)
+}
+
+// h * block where block is 16 big-endian bytes: fold the block LSB-first so
+// the low-shift accumulator a = h*2^(8b) pairs with the byte at bit offset
+// 8b; each byte's 8 bits are folded from its own low bit. ~160 doublings +
+// ~64 XORs — roughly half the work of the original 128-bit loop,
+// bit-identical (the earlier MSB-first walk computed h * byte_reverse(block)).
+fn mgm_mul_block(h: u128, blk: &[u8; 16]) -> u128 {
+    let mut r = 0u128;
+    let mut a = h;
+    for &v in blk.iter().rev() {
+        let v = v as u32;
+        if v != 0 {
+            let mut t = a;
+            for i in 0..8 {
+                if (v >> i) & 1 != 0 {
+                    r ^= t;
+                }
+                t = mgm_dbl(t);
+            }
+        }
+        a = mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(a))))))));
     }
     r
 }
@@ -369,17 +424,6 @@ fn incr_l(b: &mut [u8]) {
     }
 }
 
-fn pad16(b: &[u8]) -> Vec<u8> {
-    let rem = b.len() % 16;
-    if rem == 0 {
-        b.to_vec()
-    } else {
-        let mut v = b.to_vec();
-        v.resize(v.len() + (16 - rem), 0u8);
-        v
-    }
-}
-
 fn mgm_tag(cipher: &Kuznyechik, icn: &[u8; 16], aad: &[u8], ct: &[u8], tag_len: usize) -> Vec<u8> {
     // z = E(0b1 || icn[1..])
     let mut z = [0u8; 16];
@@ -387,14 +431,25 @@ fn mgm_tag(cipher: &Kuznyechik, icn: &[u8; 16], aad: &[u8], ct: &[u8], tag_len: 
     z[1..].copy_from_slice(&icn[1..]);
     let mut z = cipher.encrypt_block(&z);
     let mut total = 0u128;
-    for block in pad16(aad).chunks(16) {
+    let mut blk = [0u8; 16];
+    // AAD blocks (zero-pad the final partial block in place — no reallocation)
+    for c in aad.chunks(16) {
+        blk[..c.len()].copy_from_slice(c);
+        for b in blk[c.len()..].iter_mut() {
+            *b = 0;
+        }
         let h = u128::from_be_bytes(cipher.encrypt_block(&z));
-        total ^= mgm_mul(h, u128::from_be_bytes(block.try_into().unwrap()));
+        total ^= mgm_mul_block(h, &blk);
         incr_l(&mut z);
     }
-    for block in pad16(ct).chunks(16) {
+    // CT blocks
+    for c in ct.chunks(16) {
+        blk[..c.len()].copy_from_slice(c);
+        for b in blk[c.len()..].iter_mut() {
+            *b = 0;
+        }
         let h = u128::from_be_bytes(cipher.encrypt_block(&z));
-        total ^= mgm_mul(h, u128::from_be_bytes(block.try_into().unwrap()));
+        total ^= mgm_mul_block(h, &blk);
         incr_l(&mut z);
     }
     let h = u128::from_be_bytes(cipher.encrypt_block(&z));
@@ -611,6 +666,80 @@ fn mlacp_gost_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ctr_encrypt, m)?)?;
     m.add_function(wrap_pyfunction!(ctr_decrypt, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mgm_mul_reference {
+    use super::*;
+
+    // Ground truth: naive schoolbook GF(2^128) multiply, bit i of the
+    // big-endian value == coefficient of w^i, f(w)=w^128+w^7+w^2+w+1.
+    fn naive_mul(x: u128, y: u128) -> u128 {
+        let mut r = 0u128;
+        let mut xx = x;
+        let mut i = 0;
+        while i < 128 {
+            if (y >> i) & 1 == 1 {
+                r ^= xx;
+            }
+            // xx = xx * w
+            if xx >> 127 != 0 {
+                xx = (xx << 1) ^ MGM_POLY_MSB;
+            } else {
+                xx = xx << 1;
+            }
+            i += 1;
+        }
+        r
+    }
+
+    #[test]
+    fn mgm_mul_matches_naive() {
+        let cases: [u128; 3] = [
+            0x87,
+            0x01000000000000000000000000000000,
+            0xdeadbeefcafef00d1234567890abcdef,
+        ];
+        for x in cases {
+            for y in cases {
+                assert_eq!(mgm_mul(x, y), naive_mul(x, y), "mgm_mul x={:032x} y={:032x}", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn mgm_mul_block_matches_naive() {
+        let h = 0xdeadbeefcafef00d1234567890abcdefu128;
+        for bytes in [
+            [0u8; 16],
+            [1u8; 16],
+            0x0102030405060708090a0b0c0d0e0f10u128.to_be_bytes(),
+            0x0102030405060708090a0b0c0d0e0f10u128.to_le_bytes(),
+            [0xff; 16],
+            0x80000000000000000000000000000000u128.to_be_bytes(),
+        ] {
+            let blk: [u8; 16] = bytes;
+            let y = u128::from_be_bytes(blk);
+            assert_eq!(mgm_mul_block(h, &blk), naive_mul(h, y), "mul_block y={:032x}", y);
+        }
+    }
+
+    #[test]
+    fn rfc9058_a112_full_tag_via_native() {
+        let key = hex_bytes("99aabbccddeeff0011223344556677fedcba98765432100123456789abcdef88");
+        let icn = hex_bytes("1122334455667700ffeeddccbbaa9988");
+        let aad = vec![0x01u8; 16];
+        let (ct, tag) = mgm_encrypt(&key, &icn, &aad, b"", 16).unwrap();
+        assert_eq!(ct, Vec::<u8>::new());
+        assert_eq!(hex_str(&tag), "7901e9ea2085cd247ed249695f9f8a85");
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+    fn hex_str(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
 }
 
 #[cfg(test)]

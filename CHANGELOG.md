@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.1] — 2026-11-07
+
+MLACP v0.3.1 fixes the native GOST-RS authentication tag to be fully RFC 6072-2 / RFC 9058 compliant and accelerates the native crypto path. The Python API, wire format and public behaviour are unchanged.
+
+## Changes
+
+- Correct the native Rust `ctr_decrypt` counter path for RFC 6072-2: the ciphertext block is now byte-reversed before applying the keystream, and the base advances by the block number (the previous block number was used, corrupting every tag after block 0).
+- Replace the 128-iteration bit loop in `mgm_mul` with precomputed byte tables (`mgm_byte_tbls` / `mgm_mul_with`): 16 lookups + 15 XORs per multiply, bit-for-bit identical output.
+- Add `mgm_mul_block` for AAD/CT blocks: LSB-first byte folding with in-place zero padding of the final partial block (no reallocation), roughly half the work of the original loop.
+- Cache the Streebog round constants in a `OnceLock` (`c_constants`) instead of re-parsing 12 hex strings per 64-byte block (~12,000 redundant decodes for a 64 KB digest).
+- Add permanent regression guards to the Rust crate (`mgm_mul_reference`): naive schoolbook GF(2^128) cross-checks for `mgm_mul` and `mgm_mul_block`, plus the full RFC 9058 A.112 tag vector computed entirely through the native path.
+
+## Compatibility
+
+- Protocol wire version remains 1.0; native wheel package version is 0.2.1.
+- No API changes; tags produced by the native backend now match the pure-Python reference exactly.
+
+## Validation
+
+- 110 Python tests pass with both the native and pure-Python backends (1.40 s); previously failing `tests/test_performance_followup.py` (5 tests) now passes.
+- 8 Rust tests pass, including the RFC 9058 A.112 full-tag vector through the native path.
+- Local measurements: native `secure_encrypt` ≈ 35 µs (256 B) vs ≈ 1.2 ms pure-Python (~35× faster at 256 B, ~44× at 4 KB); full 110-test suite ≈ 1.4 s native vs ≈ 1.5 s pure-Python. Development measurements, not production guarantees.
+
 ## [0.3.0] — 2026-11-02
 
 MLACP v0.3.0 improves authority, routing, lookup and peer transport performance while bounding event and connection resources. It includes the newer v0.2.10 native optimization.
