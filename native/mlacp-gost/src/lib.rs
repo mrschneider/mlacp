@@ -342,15 +342,15 @@ fn mgm_dbl(x: u128) -> u128 {
 fn mgm_byte_tbls(x: u128) -> [[u128; 256]; 16] {
     let mut t = [[0u128; 256]; 16];
     let mut base = x; // base == x * 2^(8b) at iteration b
-    for b in 0..16 {
-        t[b][0] = 0;
-        t[b][1] = base;
+    for row in t.iter_mut() {
+        row[0] = 0;
+        row[1] = base;
         for k in 1..8 {
-            t[b][1 << k] = mgm_dbl(t[b][1 << (k - 1)]);
+            row[1 << k] = mgm_dbl(row[1 << (k - 1)]);
         }
         for v in 2..256 {
             let lb = v & (!v + 1);
-            t[b][v] = t[b][v & (v - 1)] ^ t[b][lb];
+            row[v] = row[v & (v - 1)] ^ row[lb];
         }
         // advance base by one BYTE (8 doublings) so t[b] is x*2^(8b); a single
         // doubling here left base at x*2^b and corrupted every t[b] for b>0.
@@ -396,7 +396,9 @@ fn mgm_mul_block(h: u128, blk: &[u8; 16]) -> u128 {
                 t = mgm_dbl(t);
             }
         }
-        a = mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(a))))))));
+        a = mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(mgm_dbl(
+            mgm_dbl(a),
+        )))))));
     }
     r
 }
@@ -686,7 +688,7 @@ mod mgm_mul_reference {
             if xx >> 127 != 0 {
                 xx = (xx << 1) ^ MGM_POLY_MSB;
             } else {
-                xx = xx << 1;
+                xx <<= 1;
             }
             i += 1;
         }
@@ -702,7 +704,13 @@ mod mgm_mul_reference {
         ];
         for x in cases {
             for y in cases {
-                assert_eq!(mgm_mul(x, y), naive_mul(x, y), "mgm_mul x={:032x} y={:032x}", x, y);
+                assert_eq!(
+                    mgm_mul(x, y),
+                    naive_mul(x, y),
+                    "mgm_mul x={:032x} y={:032x}",
+                    x,
+                    y
+                );
             }
         }
     }
@@ -720,7 +728,12 @@ mod mgm_mul_reference {
         ] {
             let blk: [u8; 16] = bytes;
             let y = u128::from_be_bytes(blk);
-            assert_eq!(mgm_mul_block(h, &blk), naive_mul(h, y), "mul_block y={:032x}", y);
+            assert_eq!(
+                mgm_mul_block(h, &blk),
+                naive_mul(h, y),
+                "mul_block y={:032x}",
+                y
+            );
         }
     }
 
@@ -735,7 +748,10 @@ mod mgm_mul_reference {
     }
 
     fn hex_bytes(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
     fn hex_str(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
