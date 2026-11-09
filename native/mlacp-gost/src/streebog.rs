@@ -9,32 +9,53 @@
 use crate::streebog_tables::{STREEBOG_C, STREEBOG_L_ROWS, TAU};
 use crate::PI;
 
-fn l_cols() -> &'static [u64; 64] {
-    // columns of the §6.4 matrix as 64-bit masks, derived from the rows
-    // exactly like the Python _streebog_l_cols (l64 iterates COLUMNS, not
-    // rows — iterating the rows was the first-port bug the vectors caught)
-    static COLS: std::sync::OnceLock<[u64; 64]> = std::sync::OnceLock::new();
-    COLS.get_or_init(|| {
-        let mut cols = [0u64; 64];
-        for (j, cj) in cols.iter_mut().enumerate() {
-            let mut c = 0u64;
-            for (k, row) in STREEBOG_L_ROWS.iter().enumerate() {
-                c |= ((row >> (63 - j)) & 1) << (63 - k);
+/// Byte-decomposition tables for l64. l is GF(2)-linear, so the
+/// contribution of input byte b (big-endian position b, 0 = MSB) is the XOR
+/// of the basis contributions of its set bits. We evaluate all 8×256 byte
+/// contributions once (each is a 64-bit v · A product) and answer every later
+/// l64 with 8 lookups + 7 XORs — replacing 64 masked popcnts and their
+/// shift/accumulate dependency chain. 16 KB total, L1/L2 resident.
+fn l64_tabs() -> &'static [[u64; 256]; 8] {
+    static T: std::sync::OnceLock<[[u64; 256]; 8]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut tabs = [[0u64; 256]; 8];
+        for b in 0..8 {
+            // l is GF(2)-linear, so a group's l64 is the XOR of each byte's
+            // contribution. Byte b (0 = MSB byte), bit i (from that byte's
+            // MSB) is input bit k = 8*b + i; a single input bit k maps to
+            // out = STREEBOG_L_ROWS[k] (out bit (63-j) = matrix row k, bit
+            // (63-j) — exactly the column-parity the old count_ones loop
+            // computed, verified below). So each byte table is the XOR of the
+            // rows for its set bits.
+            let mut basis = [0u64; 8];
+            for i in 0..8 {
+                basis[i] = STREEBOG_L_ROWS[8 * b + (7 - i)];
             }
-            *cj = c;
+            let tab = &mut tabs[b];
+            for v in 0..256u64 {
+                let mut c = 0u64;
+                for (i, bi) in basis.iter().enumerate() {
+                    if v & (1 << i) != 0 {
+                        c ^= bi;
+                    }
+                }
+                tab[v as usize] = c;
+            }
         }
-        cols
+        tabs
     })
 }
 
 fn l64(group: [u8; 8]) -> [u8; 8] {
-    // out = v · A (out bit j sums column j); count_ones is native parity
-    let v = u64::from_be_bytes(group);
-    let mut out = 0u64;
-    for col in l_cols() {
-        let par = ((v & col).count_ones() & 1) as u64;
-        out = (out << 1) | par;
-    }
+    let t = l64_tabs();
+    let out = t[0][group[0] as usize]
+        ^ t[1][group[1] as usize]
+        ^ t[2][group[2] as usize]
+        ^ t[3][group[3] as usize]
+        ^ t[4][group[4] as usize]
+        ^ t[5][group[5] as usize]
+        ^ t[6][group[6] as usize]
+        ^ t[7][group[7] as usize];
     out.to_be_bytes()
 }
 

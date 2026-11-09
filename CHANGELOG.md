@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.2] — 2026-11-08
+
+MLACP v0.3.2 accelerates the two remaining hot paths: the native Streebog
+digest (`l64`) and the pure-Python VKO scalar multiplication. The Python API,
+wire format, native wheel version (0.2.1) and public behaviour are unchanged;
+all RFC vectors pass on both backends.
+
+## Changes
+
+- **Native Streebog `l64` (Rust):** replace the 64 masked `count_ones`
+  column-parity loop with GF(2)-linear byte-decomposition tables
+  (`l64_tabs`): 8 lookups + 7 XORs per 64-bit group, 16 KB resident,
+  bit-for-bit identical to the old path (verified against 20 M random
+  64-bit inputs and the RFC 9058 A.112 full-tag vector through the native
+  path). Removes the dead `l_cols` column-mask builder.
+- **Pure-Python VKO scalar multiplication (`mlacp_core/gost_ec.py`):** the
+  8-bit window table is now built per point (bounded to 16 entries) and
+  window additions use a general Jacobian add (`_jadd_jac`) instead of
+  converting each table entry to affine. A full 512-bit scalar mult now uses
+  ONE modular inverse (the final Jacobian→affine) instead of ~512.
+
+## Validation
+
+- 110 Python tests pass on both the native and pure-Python backends; 8 Rust
+  tests pass, `cargo fmt --check` and `cargo clippy --release` are clean.
+- Local measurements (`experiments/bench.py --iterations 50 --node-frames
+  2000`, native backend, 50 calls/run, best of 3): Streebog-256/512 on 64 KB
+  drop from ≈16.05/16.38 ms to ≈2.57/2.38 ms (≈6.3×/6.9×); VKO_512 symmetric
+  agreement drops from ≈67.9 ms to ≈37.2 ms (≈1.8×). Pure-Python VKO_512
+  (same handshake, `MLACP_PURE=1`, best of 3) drops from ≈79 ms to ≈50 ms
+  (≈1.6×). Development measurements, not production guarantees.
+
 ## [0.3.1] — 2026-11-07
 
 MLACP v0.3.1 fixes the native GOST-RS authentication tag to be fully RFC 6072-2 / RFC 9058 compliant and accelerates the native crypto path. The Python API, wire format and public behaviour are unchanged.

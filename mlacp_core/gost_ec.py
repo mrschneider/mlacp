@@ -42,10 +42,10 @@ class Curve:
         self.m, self.q = m, q          # group order / subgroup order
         self.g = (gx, gy)
         self.bits = bits
-        # 8-bit precomputation window over the generator: 255 mixed adds
-        # once at first use buy ~64 mixed adds per 512-bit scalar
-        # (instead of ~128 adds + ~128 extra doubles) — see scalar_mult
-        self._g_table: list | None = None
+        # bounded cache of per-point 8-bit window tables (see _window_table):
+        # a peer's public key is reused across messages, random points are
+        # not — the bound keeps the cache from growing without limit
+        self._pt_tables: dict = {}
         if not self.on_curve(self.g):
             raise ValueError(f"{name}: generator is not on the curve")
 
@@ -105,58 +105,86 @@ class Curve:
         Zinv2 = (Zinv * Zinv) % p
         return ((X * Zinv2) % p, (Y * Zinv2 * Zinv) % p)
 
-    def _build_g_table(self) -> list:
-        if self._g_table is None:
-            # tab[i] = (i+1)·G for i in 0..255: the window code looks up
-            # tab[nib-1] for a nibble nib, i.e. it needs nib·G. Built by
-            # repeated mixed adds (255 of them, once per process).
-            G = (self.g[0], self.g[1], 1)
-            tab = [G]
-            cur = G
-            for _ in range(255):
-                cur = self._jadd(cur, self.g)  # (i+1)·G + G = (i+2)·G
-                tab.append(cur)
-            self._g_table = tab  # two threads may build twice: benign
-        return self._g_table
+    def _jadd_jac(self, P, Q) -> tuple:
+        """General Jacobian addition: BOTH P and Q are Jacobian (Z not 1).
+        Costs a few extra multiplications over the mixed form but needs NO
+        modular inverse, so a windowed scalar mult can add table entries
+        without the per-iteration pow(Z, -1, p) that dominated the old
+        affine-converting path."""
+        X1, Y1, Z1 = P
+        X2, Y2, Z2 = Q
+        if Z1 == 0:
+            return Q
+        if Z2 == 0:
+            return P
+        p = self.p
+        Z1sq = (Z1 * Z1) % p
+        Z2sq = (Z2 * Z2) % p
+        U1 = (X1 * Z2sq) % p
+        U2 = (X2 * Z1sq) % p
+        S1 = (Y1 * Z2sq * Z2) % p
+        S2 = (Y2 * Z1sq * Z1) % p
+        if U1 == U2:
+            if S1 == S2:
+                return self._jdouble(P)
+            return (1, 1, 0)
+        H = (U2 - U1) % p
+        R = (S2 - S1) % p
+        Hsq = (H * H) % p
+        Hcu = (H * Hsq) % p
+        V = (U1 * Hsq) % p
+        X3 = (R * R - Hcu - 2 * V) % p
+        Z3 = (H * Z1 * Z2) % p
+        Y3 = (R * (V - X3) - S1 * Hcu) % p
+        return (X3, Y3, Z3)
+
+    def _window_table(self, P: tuple) -> list:
+        """8-bit window table for an AFFINE point P: tab[i] = (i+1)·P kept
+        in JACOBIAN (built by mixed adds, zero inverses). The window code
+        looks up tab[nib-1] for a nibble nib. Cached per point with a small
+        bound — a peer's public key is reused across messages to that peer,
+        but random per-handshake points must not grow the cache without
+        limit."""
+        tab = self._pt_tables.get(P)
+        if tab is not None:
+            return tab
+        Pj = (P[0], P[1], 1)
+        tab = [Pj]
+        cur = Pj
+        for _ in range(255):
+            cur = self._jadd(cur, P)  # (i+1)·P + P = (i+2)·P
+            tab.append(cur)
+        if len(self._pt_tables) >= 16:
+            # bounded: drop the oldest (dicts preserve insertion order)
+            self._pt_tables.pop(next(iter(self._pt_tables)))
+        self._pt_tables[P] = tab
+        return tab
 
     def scalar_mult(self, k: int, P: tuple | None = None) -> tuple | None:
-        """Double-and-add (Jacobian). P defaults to the generator, for
-        which an 8-bit window table cuts the add count in half. P at
-        infinity (None) is returned as None; k is reduced mod q (the
-        public-key subgroup order)."""
+        """8-bit windowed double-and-add (Jacobian) with a per-point window
+        table. P defaults to the generator. The whole scalar mult uses ONE
+        modular inverse (the final Jacobian→affine); the old path converted
+        to affine on every bit/window, i.e. ~512 inverses for a 512-bit
+        scalar. P at infinity (None) is returned as None; k is reduced mod
+        q (the public-key subgroup order)."""
         k %= self.q
         if P is None:
             P = self.g
         if k == 0:
             return None
-        if P is self.g:
-            tab = self._build_g_table()
-            # MSB-first 8-bit windowing: per window R = 2^8·R + nib·G.
-            # tab[i] = (i+1)·G, so nib·G lives at tab[nib-1]. 512 doublings
-            # + ~64 mixed adds replace 512 doublings + ~256 adds.
-            nwin = (k.bit_length() + 7) // 8
-            R = None
-            for w in range(nwin - 1, -1, -1):
-                if R is None:
-                    R = (1, 1, 0)
-                else:
-                    R = self._jdouble(
+        tab = self._window_table(P)  # tab[i] = (i+1)·P, Jacobian
+        nwin = (k.bit_length() + 7) // 8
+        R = (1, 1, 0)
+        for w in range(nwin - 1, -1, -1):
+            # R = 2^8 · R
+            R = self._jdouble(
+                self._jdouble(self._jdouble(
+                    self._jdouble(self._jdouble(
                         self._jdouble(self._jdouble(
-                            self._jdouble(self._jdouble(
-                                self._jdouble(self._jdouble(
-                                    self._jdouble(R))))))))
-                nib = (k >> (8 * w)) & 0xFF
-                if nib:
-                    # tab[nib-1] is Jacobian; _jadd wants affine Q
-                    R = self._jadd(R, self._jto_affine(tab[nib - 1]))
-            return self._jto_affine(R)
-        Q = (P[0], P[1], 1)
-        R = None
-        while k:
-            if k & 1:
-                R = self._jadd(R, self._jto_affine(Q)) if R is not None else Q
-            Q = self._jdouble(Q)
-            k >>= 1
+                            self._jdouble(R))))))))
+            nib = (k >> (8 * w)) & 0xFF
+            if nib:
+                R = self._jadd_jac(R, tab[nib - 1])
         return self._jto_affine(R)
 
     def on_curve(self, P: tuple) -> bool:

@@ -174,6 +174,19 @@ Each crypto row is three runs of 20 timed calls; the envelope row verifies
 2,000/2,000 deliveries. Values are single-machine local measurements, not
 capacity guarantees, and the VKO row includes both peer operations.
 
+On the v0.3.2 tree the same harness (50 calls/run, best of 3) moved the two
+crypto hot paths:
+
+| Workload | v0.3.1 (native) | v0.3.2 (native) |
+|---|---:|---:|
+| `streebog_256` 64 KB | 15.75 ms/call | 2.57 ms/call |
+| `streebog_512` 64 KB | 16.07 ms/call | 2.38 ms/call |
+| VKO-512 symmetric agreement (two-party) | 67.9 ms/call | 37.2 ms/call |
+
+The pure-Python VKO path (same handshake under `MLACP_PURE=1`) drops from
+≈79 ms to ≈50 ms per call. The 2 KB encrypt/decrypt and loopback-envelope
+rows are unchanged.
+
 ```sh
 python experiments/bench.py --iterations 20 --node-frames 2000
 ```
