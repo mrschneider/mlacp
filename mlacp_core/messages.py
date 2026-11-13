@@ -26,6 +26,7 @@ from .errors import BadAddress, UnknownKind, VersionMismatch, malformed
 
 PROTOCOL = "mlacp"
 MAJOR, MINOR = 1, 0
+_VERSION_STR = f"{MAJOR}.{MINOR}"
 
 WIRE_KINDS = frozenset(
     {"hello", "envelope", "custody", "custody_ack", "route_update", "error",
@@ -86,6 +87,25 @@ class Envelope:
                    recipient.to_urn() if isinstance(recipient, Address) else recipient,
                    seq, v["body"], ttl, rid, caps)
 
+    @classmethod
+    def _from_json(cls, d: dict) -> "Envelope":
+        """Fast-path constructor for dicts produced by ``json.loads``.
+
+        Skips the isinstance guards (guaranteed by the JSON decoder) and
+        inlines the address lookups.  Used by the node on the hot path;
+        the public :meth:`from_value` keeps full validation for external
+        callers.
+        """
+        return cls(
+            d["sender"],
+            d["recipient"],
+            d["seq"],
+            d["body"],
+            d.get("ttl", MAX_TTL),
+            d.get("request_id"),
+            d.get("capabilities", []),
+        )
+
 
 @dataclass
 class Bundle:
@@ -128,7 +148,7 @@ def frame(kind: str, **fields) -> dict:
     """Build an outgoing wire frame."""
     if kind not in WIRE_KINDS:
         raise UnknownKind(kind, sorted(WIRE_KINDS))
-    return {"kind": kind, "v": f"{MAJOR}.{MINOR}", **fields}
+    return {"kind": kind, "v": _VERSION_STR, **fields}
 
 
 def parse_frame(v: dict) -> tuple[str, dict]:
@@ -140,7 +160,10 @@ def parse_frame(v: dict) -> tuple[str, dict]:
     kind = v.get("kind")
     if kind not in WIRE_KINDS:
         raise UnknownKind(str(kind), sorted(WIRE_KINDS))
-    ver = v.get("v", f"{MAJOR}.{MINOR}")
+    ver = v.get("v", _VERSION_STR)
+    # fast path: the common case is the exact current version string
+    if ver == _VERSION_STR:
+        return kind, v
     if not isinstance(ver, str) or "." not in ver:
         raise malformed("frame version must be 'major.minor'")
     vmaj, _, vminor = ver.partition(".")

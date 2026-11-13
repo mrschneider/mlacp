@@ -33,6 +33,10 @@ _LEVELS = ("org", "zone", "node", "service")
 # Bounded LRU so a long-lived node can't leak via an adversarial URN stream.
 _ADDRESS_CACHE: dict[str, Address] = {}
 _ADDRESS_CACHE_MAX = 4096
+# Inverse cache: Address -> URN string.  to_urn() is called up to 6× per
+# frame on the hot path; the f-string is cheap but the cache eliminates it
+# entirely for repeat addresses (the common case in a long-lived node).
+_URN_STR_CACHE: dict[Address, str] = {}
 
 
 @dataclass(frozen=True)
@@ -57,11 +61,17 @@ class Address:
         a = cls(**m.groupdict())
         if len(_ADDRESS_CACHE) < _ADDRESS_CACHE_MAX:
             _ADDRESS_CACHE[urn] = a
+            _URN_STR_CACHE[a] = urn  # the input string IS the canonical URN
         return a
 
     # -- behavior ------------------------------------------------------------
     def to_urn(self) -> str:
-        return f"mlacp:{self.org}/{self.zone}/{self.node}/{self.service}"
+        cached = _URN_STR_CACHE.get(self)
+        if cached is not None:
+            return cached
+        s = f"mlacp:{self.org}/{self.zone}/{self.node}/{self.service}"
+        _URN_STR_CACHE[self] = s
+        return s
 
     def org_of(self) -> str:
         return self.org

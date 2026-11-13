@@ -35,7 +35,7 @@ class HierarchicalDirectory:
     _counts: dict[str, int] = field(default_factory=dict)
 
     _by_service: dict = field(default_factory=dict, init=False, repr=False)
-    _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
+    _lock: object = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
         for entry in self._entries.values():
@@ -64,17 +64,20 @@ class HierarchicalDirectory:
                 del self._by_service[key]
 
     # -- resolution with zone-widening ------------------------------------------
-    @locked
     def resolve(self, urn: str) -> Entry:
-        addr = Address.parse(urn)
-        exact = self._entries.get(addr.to_urn())
-        if exact is not None:
-            return exact
-        # zone-widening: any zone of the same org, same node+service
-        candidates = self._by_service.get((addr.org, addr.node, addr.service), {})
-        if candidates:
-            return next(iter(candidates.values()))
-        raise UnknownService(addr.to_urn())
+        with self._lock:
+            # Fast path: the wire URN IS the canonical string (validated at
+            # parse_frame / Envelope.from_value).  A direct dict hit skips
+            # the Address.parse → to_urn round-trip entirely.
+            entry = self._entries.get(urn)
+            if entry is not None:
+                return entry
+            # Zone-widening: any zone of the same org, same node+service
+            addr = Address.parse(urn)
+            candidates = self._by_service.get((addr.org, addr.node, addr.service), {})
+            if candidates:
+                return next(iter(candidates.values()))
+            raise UnknownService(urn)
 
     @locked
     def query(self, predicate) -> list[Entry]:
@@ -82,16 +85,16 @@ class HierarchicalDirectory:
         return [e for e in self._entries.values() if predicate(e)]
 
     # -- accounting (Akademset rateo) -------------------------------------------
-    @locked
     def account(self, org: str) -> int:
         """Charge one message to the organization, enforcing its quota."""
-        n = self._counts.get(org, 0) + 1
-        if n > self.org_quota:
-            raise QuotaExceeded(
-                f"organization '{org}' exceeded its quota of {self.org_quota}"
-            )
-        self._counts[org] = n
-        return n
+        with self._lock:
+            n = self._counts.get(org, 0) + 1
+            if n > self.org_quota:
+                raise QuotaExceeded(
+                    f"organization '{org}' exceeded its quota of {self.org_quota}"
+                )
+            self._counts[org] = n
+            return n
 
     @locked
     def usage(self, org: str) -> int:

@@ -155,16 +155,15 @@ def test_context_matches_reference_and_refuses_tampering(size):
 
 
 def test_node_contexts_are_bounded_and_use_fresh_ivs():
-    from mlacp_core.messages import Envelope
     node = CenterNode('mlacp:o/z/n/s', link_key=bytes(32))
-    env = Envelope('mlacp:o/z/n/a', 'mlacp:o/z/n/b', 1, {'x': 1})
-    first, second = node._secure_body(env), node._secure_body(env)
+    body = {'x': 1}
+    first, second = node._secure_body(body), node._secure_body(body)
     assert first != second
     assert node._unsecure_body(first) == {'x': 1}
     for i in range(1, 6):
         key = bytes([i])*32
         node._adopt_link_key(key, i+1, 'offer', 'test', 1)
-        node._secure_body(env)
+        node._secure_body(body)
     assert len(node._crypto_contexts) == 3
     assert len(node.link_keys) == 3
     assert set(node._crypto_contexts) <= set(node.link_keys)

@@ -69,8 +69,7 @@ def test_rekey_rotates_the_link_key_with_forward_secrecy():
         # FORWARD SECRECY: NEW traffic (post-re-key) is NOT decryptable
         # under the OLD key — a captor holding only kek1 learns nothing
         from mlacp_core.gost import secure_decrypt
-        body = n2._secure_body(type(
-            "E", (), {"body": {"order": "epoch-2 secret"}})())
+        body = n2._secure_body({"order": "epoch-2 secret"})
         payload = __import__("base64").b64decode(body["payload"])
         with __import__("pytest").raises(ValueError):
             secure_decrypt(kek1, payload)     # the old key is USELESS here
