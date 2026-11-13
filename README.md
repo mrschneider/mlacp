@@ -187,6 +187,21 @@ The pure-Python VKO path (same handshake under `MLACP_PURE=1`) drops from
 ≈79 ms to ≈50 ms per call. The 2 KB encrypt/decrypt and loopback-envelope
 rows are unchanged.
 
+The pure-Python reference (`MLACP_PURE=1`) got the same treatment on the two
+hot functions: Streebog's `l64` moved from a 64-column `bit_count` loop to an
+8×256 byte table (mirroring the native path), its `LPS` is now a single fused
+64-lookup pass, and Kuznyechik's forward `LSX` round is a fused 16-lookup
+table. Measured on the same machine:
+
+| Workload | before (pure) | after (pure) |
+|---|---:|---:|
+| `streebog_256` 64 KB | 1.57 s/call | 0.19 s/call |
+| `streebog_512` 64 KB | 1.58 s/call | 0.17 s/call |
+| `secure_encrypt` 2 KB | 8.0 ms/call | 6.8 ms/call |
+| `ctr_encrypt` 2 KB | 2.4 ms/call | 1.9 ms/call |
+
+The native backend is untouched and remains the fast path.
+
 ```sh
 python experiments/bench.py --iterations 20 --node-frames 2000
 ```
