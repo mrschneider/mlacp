@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.3.3] — 2026-11-12
+
+MLACP v0.3.3 accelerates the pure-Python GOST reference
+(`MLACP_PURE=1`) by fusing its Streebog and Kuznyechik transformation
+tables. The Python API, wire format, native wheel version (0.2.1) and
+public behaviour are unchanged; the native backend is untouched and
+remains the fast path.
+
+## Changes
+
+- **Pure-Python Streebog `l64` (`mlacp_core/gost.py`):** replace the
+  64-column `bit_count` parity loop with 8×256 GF(2)-linear byte tables
+  (each input bit selects a lookup; output is XOR-composed), ~13× faster
+  than the per-column loop.
+- **Pure-Python Streebog `LPS` (L∘P∘S):** fuse translate, permutation
+  and the eight linear groups into a single 64-entry contribution table
+  (64 big-int lookups + 63 XORs) instead of `translate` + 64 `getitem`
+  accesses + 8 group calls, ~40% faster.
+- **Pure-Python Streebog `L`:** the eight output groups are now written
+  directly into a `bytearray` (no generator + `join` with double copies).
+- **Pure-Python Kuznyechik `LSX`/`LSI`:** the forward `LSX` round uses a
+  fused L∘S 16-lookup table per round (~1.4× faster); the inverse `LSI`
+  path keeps the inverse permutation inline and folds the S_inv lookup
+  into a big-int XOR, since L_inv runs before S_inv and cannot be fused
+  the same way. Round keys are stored as ints for the final XOR.
+
+## Validation
+
+- 110 Python tests pass on both the native and pure-Python backends; the
+  RFC conformance vectors are unchanged and green.
+- Local measurements (`experiments/bench.py --iterations 20
+  --node-frames 2000`, `MLACP_PURE=1`): Streebog-256/512 on 64 KB drop
+  from ≈1.57/1.58 s to ≈0.18/0.18 s per call (≈8.5×/8.8×); 2 KB
+  `secure_encrypt` drops from ≈8.0 ms to ≈6.8 ms and `ctr_encrypt` from
+  ≈2.4 ms to ≈1.9 ms. The native-backend rows are unchanged. Development
+  measurements, not production guarantees.
+
 ## [0.3.2] — 2026-11-08
 
 MLACP v0.3.2 accelerates the two remaining hot paths: the native Streebog
