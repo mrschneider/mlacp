@@ -19,7 +19,19 @@ private keys, both KEK values byte-for-byte):
 
 from __future__ import annotations
 
+import os
+
 from .gost import streebog_practical
+
+__all__ = [
+    "Curve",
+    "CURVE_512A",
+    "CURVE_256A",
+    "generate_keypair",
+    "point_to_wire",
+    "point_from_wire",
+    "vko",
+]
 
 
 class Curve:
@@ -195,6 +207,19 @@ class Curve:
         """The public key private·G — the RFC 7836 examples verify this."""
         return self.scalar_mult(private)
 
+    def validate(self, P: tuple | None) -> bool:
+        """Full public-key validation: the point must be on the curve AND
+        in the prime-order subgroup (q·P = O). Critical for curves with
+        cofactor > 1 (e.g. 256A, cofactor 4) where an on-curve point can
+        still lie in a small-order coset — a small-subgroup attack vector.
+        Returns True only when P is a valid public key for VKO."""
+        if P is None:
+            return False  # point at infinity is not a valid public key
+        if not self.on_curve(P):
+            return False
+        # small-subgroup check: q·P must be the point at infinity
+        return self.scalar_mult(self.q, P) is None
+
 
 def _curve_512a() -> Curve:
     """id-tc26-gost-3410-12-512-paramSetA (RFC 7836 Appendix A.1)."""
@@ -255,7 +280,6 @@ CURVE_256A = _curve_256a()
 def generate_keypair(curve: Curve) -> tuple[int, tuple]:
     """An ephemeral VKO keypair: (private, public) with the public point on
     the curve. The private scalar is os.urandom-sourced."""
-    import os
     while True:
         d = int.from_bytes(os.urandom(curve.bits // 8), "little")
         if 0 < d < curve.q:
@@ -271,11 +295,18 @@ def point_to_wire(curve: Curve, P: tuple) -> dict:
 
 
 def point_from_wire(curve: Curve, wire: dict) -> tuple:
+    """Decode a peer public point from its wire form (X, Y little-endian
+    hex) and FULLY validate it: on the curve AND in the prime-order
+    subgroup (``Curve.validate``). Refusing small-order coset points
+    closes the small-subgroup attack vector, which matters for 256A
+    (cofactor 4)."""
     w = curve.bits // 8
     P = (int.from_bytes(bytes.fromhex(wire["x"]), "little"),
          int.from_bytes(bytes.fromhex(wire["y"]), "little"))
-    if not curve.on_curve(P):
-        raise ValueError("peer public key is not on the curve")
+    if not curve.validate(P):
+        raise ValueError("peer public key is not a valid curve point "
+                         "(not on the curve or not in the prime-order "
+                         "subgroup)")
     return P
 
 

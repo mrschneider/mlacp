@@ -42,7 +42,7 @@ class CapabilityChain:
     _holders: dict = field(default_factory=dict, init=False, repr=False)
     _children: dict = field(default_factory=dict, init=False, repr=False)
     _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
-    _counter = itertools.count(1)
+    _counter: itertools.count = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
 
     def __post_init__(self):
         if self.history_limit is not None and self.history_limit < 0:

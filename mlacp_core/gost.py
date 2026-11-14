@@ -22,6 +22,10 @@ Handshake (GOST R 34.10-2012 / VKO, RFC 7836) lives in ``gost_ec.py``.
 
 from __future__ import annotations
 
+import hmac as _hmac
+import os as _os
+import threading as _threading
+
 # ---------------------------------------------------------------------------
 # Kuznyechik — parameters (RFC 7801 §4.1)
 # ---------------------------------------------------------------------------
@@ -251,20 +255,22 @@ class Kuznyechik:
     _CONSTANTS: list | None = None
     # round-key schedules are pure functions of the key: cache the last few
     _RK_CACHE: dict = {}
+    _RK_LOCK = _threading.Lock()
 
     def __init__(self, key: bytes):
         if len(key) != 32:
             raise ValueError("Kuznyechik key must be 32 bytes (V_256)")
-        cached = self._RK_CACHE.get(key)
-        if cached is not None:
-            self._rk, self._rki = cached
-            return
-        self._rk = self._key_schedule(key)
-        # integer round keys for the fused big-int final XORs
-        self._rki = [int.from_bytes(k, "big") for k in self._rk]
-        if len(self._RK_CACHE) >= 8:
-            self._RK_CACHE.pop(next(iter(self._RK_CACHE)))
-        self._RK_CACHE[key] = (self._rk, self._rki)
+        with self._RK_LOCK:
+            cached = self._RK_CACHE.get(key)
+            if cached is not None:
+                self._rk, self._rki = cached
+                return
+            self._rk = self._key_schedule(key)
+            # integer round keys for the fused big-int final XORs
+            self._rki = [int.from_bytes(k, "big") for k in self._rk]
+            if len(self._RK_CACHE) >= 8:
+                self._RK_CACHE.pop(next(iter(self._RK_CACHE)))
+            self._RK_CACHE[key] = (self._rk, self._rki)
 
     def _key_schedule(self, key: bytes):
         k1, k2 = key[:16], key[16:]
@@ -543,7 +549,7 @@ def mgm_decrypt(key: bytes, icn: bytes, aad: bytes, ciphertext: bytes,
         pt += ((int.from_bytes(block, "big") << (8 * (16 - len(block))))
                ^ int.from_bytes(ks, "big")).to_bytes(16, "big")[: len(block)]
         y = _incr_r(y)
-    if _mgm_tag(cipher, icn, aad, ciphertext, len(tag)) != tag:
+    if not _hmac.compare_digest(_mgm_tag(cipher, icn, aad, ciphertext, len(tag)), tag):
         raise ValueError("MGM tag verification failed — frame altered in transit")
     return bytes(pt)
 
@@ -915,8 +921,6 @@ def _ctr_blocks(cipher, iv: bytes, count: int):
 
 def ctr_acpkm_encrypt(key: bytes, icn: bytes, plaintext: bytes,
                       cipher_cls=None, section_bytes: int = 32) -> bytes:
-    if cipher_cls is None:
-        cipher_cls = Kuznyechik
     """CTR-ACPKM (R 1323565.1.017-2018 §6.2.2 / draft-12 §6.2.2): CTR with
     internal re-keying — the message is split into sections of
     ``section_bytes``; at every boundary the section key K^j is refreshed as
@@ -924,6 +928,8 @@ def ctr_acpkm_encrypt(key: bytes, icn: bytes, plaintext: bytes,
     CTR counter keeps running across sections. The initial key is K^1.
     Verified against the draft's official AES-256 test example (k=256, n=128,
     N=256: section keys F680D121…, 8EB97E43…, C5716CC9…)."""
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
     cipher = cipher_cls(key)
     m = cipher.BLOCK
     if len(icn) != m:
@@ -964,8 +970,6 @@ def ctr_acpkm_decrypt(key: bytes, icn: bytes, ciphertext: bytes,
 def ctr_acpkm_master(key: bytes, icn: bytes, plaintext: bytes,
                      cipher_cls=None, section_bytes: int = 32,
                      master_chunk_bytes: int = 64) -> bytes:
-    if cipher_cls is None:
-        cipher_cls = Kuznyechik
     """CTR-ACPKM-Master (draft-12 §6.3.2): a CTR-ACPKM keyed with the MASTER
     key over zeros (re-keying itself every ``master_chunk_bytes`` = T*)
     generates the section keys K^1 | K^2 | ... (k bytes each); the message
@@ -973,6 +977,8 @@ def ctr_acpkm_master(key: bytes, icn: bytes, plaintext: bytes,
     under K^j, the CTR counter running across the whole message.
     Verified against the draft's official AES-256 test example (N = 256,
     T* = 512)."""
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
     cipher = cipher_cls(key)
     m = cipher.BLOCK
     if len(icn) != m or section_bytes % m or master_chunk_bytes % len(key):
@@ -999,8 +1005,6 @@ def ctr_acpkm_master(key: bytes, icn: bytes, plaintext: bytes,
 def omac_acpkm_master(key: bytes, data: bytes, tag_len: int = 16,
                       cipher_cls=None, section_bytes: int = 32,
                       master_chunk_bytes: int = 96) -> bytes:
-    if cipher_cls is None:
-        cipher_cls = Kuznyechik
     """OMAC-ACPKM-Master (draft-12 §6.3.6, the gost-engine construction):
     a CTR-ACPKM keyed with the MASTER key over zeros (re-keying itself
     every ``master_chunk_bytes`` = T*) generates the key material; every
@@ -1010,6 +1014,8 @@ def omac_acpkm_master(key: bytes, data: bytes, tag_len: int = 16,
     message is CBC-MAC'd section by section, chaining across boundaries.
     Verified against the draft's official AES-256 test example
     (T* = 768, N = 256, MAC = B3ADB8921832054C0921E7B808CFA0B8)."""
+    if cipher_cls is None:
+        cipher_cls = Kuznyechik
     cipher = cipher_cls(key)
     m = cipher.BLOCK
     if section_bytes % m:
@@ -1201,7 +1207,7 @@ def gcm_acpkm_decrypt(key: bytes, icn: bytes, aad: bytes, ciphertext: bytes,
     ct, computed = _gcm_acpkm_core(key, icn, aad, ciphertext, cipher_cls,
                                    section_bytes, c, master=False,
                                    master_chunk_bytes=None, encrypt=False)
-    if computed[:len(tag)] != tag:
+    if not _hmac.compare_digest(computed[:len(tag)], tag):
         raise ValueError("GCM-ACPKM tag verification failed")
     return ct
 
@@ -1233,7 +1239,7 @@ def gcm_acpkm_master_decrypt(key: bytes, icn: bytes, aad: bytes,
     ct, computed = _gcm_acpkm_core(key, icn, aad, ciphertext, cipher_cls,
                                    section_bytes, c, master=True,
                                    master_chunk_bytes=master_chunk_bytes, encrypt=False)
-    if computed[:len(tag)] != tag:
+    if not _hmac.compare_digest(computed[:len(tag)], tag):
         raise ValueError("GCM-ACPKM-Master tag verification failed")
     return ct
 
@@ -1248,7 +1254,6 @@ def gcm_acpkm_master_decrypt(key: bytes, icn: bytes, aad: bytes,
 # pure-Python path (e.g. to bisect a discrepancy, or where the wheel is not
 # available).
 # ---------------------------------------------------------------------------
-import os as _os
 
 _pure_secure_encrypt = secure_encrypt
 _pure_secure_decrypt = secure_decrypt
@@ -1298,3 +1303,25 @@ if NATIVE_BACKEND:
         from mlacp_gost_rs import SecureContext
     except ImportError:
         pass
+
+__all__ = [
+    # block ciphers
+    "Kuznyechik", "Magma",
+    # modes
+    "ctr_encrypt", "ctr_decrypt",
+    "mgm_encrypt", "mgm_decrypt",
+    "gost_mac",
+    "secure_encrypt", "secure_decrypt",
+    # ACPKM
+    "ctr_acpkm_encrypt", "ctr_acpkm_decrypt",
+    "ctr_acpkm_master",
+    "omac_acpkm_master",
+    "gcm_acpkm_encrypt", "gcm_acpkm_decrypt",
+    "gcm_acpkm_master_encrypt", "gcm_acpkm_master_decrypt",
+    # hashes
+    "streebog", "streebog_256", "streebog_512", "streebog_practical",
+    # context
+    "SecureContext",
+    # backend flag
+    "NATIVE_BACKEND",
+]

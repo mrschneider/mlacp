@@ -10,7 +10,6 @@ relay never inspects a bundle body.
 
 from __future__ import annotations
 
-import itertools
 import threading
 from ._locking import locked
 from dataclasses import dataclass, field
@@ -25,22 +24,13 @@ class UnknownBundle(BusinessRefusal):
 
 
 @dataclass
-class Release:
-    """A bundle the relay released on re-registration, awaiting its ack."""
-
-    bundle: Bundle
-
-
-@dataclass
 class CustodyRelay:
     """The store-and-dump agent. ``capacity`` bounds the onboard memory —
     refusing at admission (not silently dropping) is the feature."""
 
     capacity: int = 256
     _held: dict[str, Bundle] = field(default_factory=dict)   # bundle_id -> bundle
-    _pending: dict[str, Release] = field(default_factory=dict)  # released, unacked
-    _next: dict[str, int] = field(default_factory=dict)      # addressee -> next seq
-    _counter = itertools.count()
+    _pending: dict[str, Bundle] = field(default_factory=dict)  # released, unacked
     _by_addressee: dict = field(default_factory=dict, init=False, repr=False)
     _expired_ids: set = field(default_factory=set, init=False, repr=False)
     _lock: object = field(default_factory=threading.RLock, init=False, repr=False)
@@ -92,7 +82,7 @@ class CustodyRelay:
                 self._remove_held(b.bundle_id)
                 continue
             self._remove_held(b.bundle_id)
-            self._pending[b.bundle_id] = Release(b)
+            self._pending[b.bundle_id] = b
             out.append(b)
         return out
 

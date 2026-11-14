@@ -385,7 +385,6 @@ class CenterNode:
         encrypts new traffic."""
         from mlacp_core.gost_ec import CURVE_512A, generate_keypair, \
             point_to_wire
-        import os
         curve = curve or CURVE_512A
         d, pub = generate_keypair(curve)
         ukm = int.from_bytes(os.urandom(8), "little")

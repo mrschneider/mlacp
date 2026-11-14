@@ -36,7 +36,9 @@ _ADDRESS_CACHE_MAX = 4096
 # Inverse cache: Address -> URN string.  to_urn() is called up to 6× per
 # frame on the hot path; the f-string is cheap but the cache eliminates it
 # entirely for repeat addresses (the common case in a long-lived node).
+# Bounded to prevent unbounded growth from adversarial URN streams.
 _URN_STR_CACHE: dict[Address, str] = {}
+_URN_STR_CACHE_MAX = 4096
 
 
 @dataclass(frozen=True)
@@ -70,7 +72,8 @@ class Address:
         if cached is not None:
             return cached
         s = f"mlacp:{self.org}/{self.zone}/{self.node}/{self.service}"
-        _URN_STR_CACHE[self] = s
+        if len(_URN_STR_CACHE) < _URN_STR_CACHE_MAX:
+            _URN_STR_CACHE[self] = s
         return s
 
     def org_of(self) -> str:

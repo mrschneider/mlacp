@@ -87,26 +87,6 @@ class Envelope:
                    recipient.to_urn() if isinstance(recipient, Address) else recipient,
                    seq, v["body"], ttl, rid, caps)
 
-    @classmethod
-    def _from_json(cls, d: dict) -> "Envelope":
-        """Fast-path constructor for dicts produced by ``json.loads``.
-
-        Skips the isinstance guards (guaranteed by the JSON decoder) and
-        inlines the address lookups.  Used by the node on the hot path;
-        the public :meth:`from_value` keeps full validation for external
-        callers.
-        """
-        return cls(
-            d["sender"],
-            d["recipient"],
-            d["seq"],
-            d["body"],
-            d.get("ttl", MAX_TTL),
-            d.get("request_id"),
-            d.get("capabilities", []),
-        )
-
-
 @dataclass
 class Bundle:
     """A custody unit (layer 2). The relay NEVER inspects ``body`` —

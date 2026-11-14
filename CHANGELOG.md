@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.3.5] — 2026-11-14
+
+MLACP v0.3.5 is a security and robustness release. It closes a
+small-subgroup attack vector in VKO public-key validation, fixes a
+shared-counter bug that caused grant-ID collisions, hardens MAC tag
+comparisons against timing side-channels, and removes dead code and
+unbounded caches. The Python API, wire format and native wheel are
+unchanged.
+
+## Changes
+
+- **VKO small-subgroup protection (`mlacp_core/gost_ec.py`):** new
+  `Curve.validate(P)` performs full public-key validation — the point
+  must be on the curve **and** in the prime-order subgroup (q·P = O).
+  `point_from_wire` now calls `validate` instead of the weaker
+  `on_curve` check. This closes the small-subgroup attack vector that
+  is exploitable on 256A (cofactor 4), where an on-curve point can
+  still lie in a small-order coset.
+- **MAC timing-safe comparisons (`mlacp_core/gost.py`):** `mgm_decrypt`,
+  `gcm_acpkm_decrypt` and `gcm_acpkm_master_decrypt` now use
+  `hmac.compare_digest` instead of `!=` for tag verification, preventing
+  timing side-channel leakage of the expected tag.
+- **Kuznyechik round-key cache lock (`mlacp_core/gost.py`):** the shared
+  `_RK_CACHE` in `Kuznyechik.__init__` is now guarded by a
+  `threading.Lock` to prevent race conditions under concurrent
+  construction.
+- **CapabilityChain per-instance counter (`mlacp_core/authority.py`):**
+  `_counter` was a class-level `itertools.count(1)` shared by all
+  instances, causing grant-ID collisions when multiple `CapabilityChain`
+  objects coexist. Now a per-instance field via `default_factory`.
+- **Custody relay cleanup (`mlacp_core/custody.py`):** removed the dead
+  `Release` dataclass wrapper (the relay now stores `Bundle` directly in
+  `_pending`); removed the unused `_next` field and `itertools` import.
+- **Bounded URN-string cache (`mlacp_core/addresses.py`):**
+  `_URN_STR_CACHE` is now capped at 4 096 entries to prevent unbounded
+  memory growth from an adversarial stream of unique URNs on a
+  long-lived node.
+- **Dead code removal (`mlacp_core/messages.py`, `mlacp_engine/node.py`):**
+  removed `Envelope._from_json` (no callers) and a redundant local
+  `import os` in `CenterNode.initiate_handshake`.
+- **Docstring placement fix (`mlacp_core/gost.py`):** in
+  `ctr_acpkm_encrypt`, `ctr_acpkm_master` and `omac_acpkm_master` the
+  `if cipher_cls is None` default was placed before the docstring,
+  making the docstring a dead string expression. Moved after the
+  docstring so `__doc__` is set correctly.
+- **Module exports (`mlacp_core/gost.py`, `mlacp_core/gost_ec.py`):**
+  added explicit `__all__` lists.
+
+## Validation
+
+- 110 Python tests pass (native and pure-Python backends); RFC
+  conformance vectors unchanged and green.
+
 ## [0.3.3] — 2026-11-12
 
 MLACP v0.3.3 accelerates the pure-Python GOST reference
