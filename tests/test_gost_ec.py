@@ -62,6 +62,24 @@ def _random_on_curve_point(c):
             return (x, y)
 
 
+def _small_subgroup_point(c):
+    """A point OUTSIDE the prime-order subgroup (order 2 or 4).
+
+    ``q·R`` kills the prime-order part of a random on-curve ``R``, so the
+    result lies in the small subgroup — but it can land on the IDENTITY,
+    when ``R`` happened to be inside the prime-order subgroup itself.
+    Picking a random ``R`` without checking is therefore FLAKY: the test
+    failed in roughly half the runs. Retry until the small-subgroup
+    component is non-zero.
+    """
+    for _ in range(64):
+        R = _random_on_curve_point(c)
+        Q = c.scalar_mult(c.q, R, reduce=False)
+        if Q is not None:
+            return Q
+    raise AssertionError("could not build a small-subgroup point")  # pragma: no cover
+
+
 def test_small_subgroup_points_are_refused_on_a_cofactor_curve():
     """A cofactor-4 curve has points of order 2 and 4 OUTSIDE the prime
     order subgroup. Accepting one as a peer public key makes the derived
@@ -74,15 +92,27 @@ def test_small_subgroup_points_are_refused_on_a_cofactor_curve():
     The test now multiplies by the FULL q (no reduction)."""
     c = CURVE_256A
     assert c.m != c.q, "this curve is supposed to have a cofactor"
-    R = _random_on_curve_point(c)
-    assert c.on_curve(R)
-    # q·R kills the prime-order part: the result lies in the small subgroup
-    Q = c.scalar_mult(c.q, R, reduce=False)
-    assert Q is not None
+    Q = _small_subgroup_point(c)
     assert c.on_curve(Q), "the small-subgroup point is still on the curve"
     assert c.scalar_mult(c.q, Q, reduce=False) is not None, \
         "Q is NOT in the prime-order subgroup"
     assert not c.validate(Q), "a small-subgroup point must be refused"
+
+
+def test_the_order_two_point_is_refused():
+    """The 2-torsion point (y == 0) is the canonical small-subgroup point:
+    it has order 2, so q·P = P ≠ O. It exists whenever the cubic
+    x³ + a·x + b has a root modulo p."""
+    c = CURVE_256A
+    for x in range(0, 100000):
+        if (x * x * x + c.a * x + c.b) % c.p == 0:
+            break
+    else:
+        return  # no 2-torsion point on this curve: nothing to assert
+    T = (x, 0)
+    assert c.on_curve(T)
+    assert c.scalar_mult(c.q, T, reduce=False) is not None
+    assert not c.validate(T), "the 2-torsion point must be refused"
 
 
 def test_the_prime_order_subgroup_is_still_accepted():

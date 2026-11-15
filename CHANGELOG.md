@@ -29,7 +29,12 @@ every frame. The wire format is unchanged.
 - **Regression tests (`tests/test_gost_ec.py`):** a small-subgroup point
   (`q·R` for a random on-curve `R`) is refused on 256A, a legitimate
   public key is still accepted on both curves, and a cofactor-1 curve
-  accepts an on-curve point without the redundant test.
+  accepts an on-curve point without the redundant test. The small-subgroup
+  point is built deterministically: `q·R` lands on the identity whenever
+  `R` happens to sit inside the prime-order subgroup, so the test retries
+  until the small-subgroup component is non-zero (a naive random pick
+  failed in roughly half the runs and broke CI). The 2-torsion point
+  (`y == 0`) is covered as well when the curve has one.
 
 ### Performance
 
