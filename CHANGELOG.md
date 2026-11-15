@@ -1,5 +1,86 @@
 # Changelog
 
+## [0.3.6] — 2026-11-15
+
+MLACP v0.3.6 is a correctness-and-throughput release. It repairs the
+small-subgroup validation that v0.3.5 introduced but that never actually
+ran (the subgroup test was a tautology), and it removes the lock traffic,
+buffer copies and wire padding that the delivery path was still paying on
+every frame. The wire format is unchanged.
+
+### Fixed
+
+- **The small-subgroup check was a no-op (`mlacp_core/gost_ec.py`):
+  v0.3.5 shipped `Curve.validate(P)` as "on the curve AND in the
+  prime-order subgroup", but the subgroup test called
+  `scalar_mult(self.q, P)` — and that path reduced the scalar modulo `q`.
+  `q mod q` is `0`, the reduced scalar short-circuited to the point at
+  infinity, and **every on-curve point passed the validation**. On 256A
+  (cofactor 4) a peer could therefore present a point of order 2 or 4 and
+  have it accepted as a public key; the KEK derived from it is then
+  predictable to whoever chose the point. The check now multiplies by the
+  **full** `q` (`scalar_mult(..., reduce=False)`) and compares against the
+  point at infinity.
+- **Cost of the fix:** a cofactor-1 curve (512A: `m == q`) has every
+  on-curve point in the prime-order subgroup, so the subgroup test is
+  mathematically redundant there and is now **skipped** — the default
+  handshake pays nothing. Only cofactor > 1 curves (256A) run the real
+  test, which costs one scalar multiplication.
+- **Regression tests (`tests/test_gost_ec.py`):** a small-subgroup point
+  (`q·R` for a random on-curve `R`) is refused on 256A, a legitimate
+  public key is still accepted on both curves, and a cofactor-1 curve
+  accepts an on-curve point without the redundant test.
+
+### Performance
+
+- **One directory lock per frame (`mlacp_core/directory.py`,
+  `mlacp_engine/node.py`):** the per-organization quota charge and the
+  mandatory registration check are now a single operation
+  (`charge_and_resolve`) under one lock instead of two acquisitions per
+  frame. The refusal order (quota before registration) is unchanged.
+- **Lock-free read path (`mlacp_core/directory.py`):** `resolve` no longer
+  takes the directory lock on the hit path — a `dict.get` is atomic under
+  the GIL and a read cannot observe a torn dict. Only the zone-widening
+  fallback (a walk of the service index) locks.
+- **Socket timeout applied once (`mlacp_engine/channels.py`,
+  `mlacp_engine/node.py`):** the read timeout was re-applied to the socket
+  on every read (`setsockopt` per frame). It is now cached per channel and
+  only re-applied when it changes; the remaining time is quantized to
+  5 ms so consecutive reads ask for the same value. The total read
+  deadline can exceed the requested one by at most 5 ms.
+- **In-place line buffer (`mlacp_engine/node.py`):** the JSON line buffer
+  lives on the channel as a `bytearray` and is consumed in place — three
+  copies of every frame's bytes removed.
+- **Compact fallback serialization (`mlacp_core/wire.py`):** the stdlib
+  fallback writes `","`/`":"` separators instead of the default `", "`/
+  `": "` — the same JSON value with ~10–15 % fewer bytes on the wire.
+
+### Packaging and CI
+
+- **`orjson` is declared as an extra (`pyproject.toml`):**
+  `pip install mlacp[speed]`. The stdlib fallback keeps the protocol
+  importable on minimal environments (no C extensions, musl, PyPy).
+- **The CI now runs the suite and the cross-language E2E twice** — once
+  with `orjson` and once with it blocked — so the fallback cannot rot.
+- **New wire contract tests (`tests/test_wire.py`):** round trip, the
+  compact form, the byte-stable canonical (sorted) form used as the MGM
+  plaintext, and the agreement between the two backends.
+
+### Measurements
+
+Single machine, native backend, best of 6 alternating runs:
+
+| Workload | v0.3.5 | v0.3.6 |
+|---|---:|---:|
+| Local envelope delivery (100k frames, in-process dispatch) | 3.06 µs/frame (avg) | 2.95 µs/frame (avg) |
+| Repository harness — 2,000 envelopes over a loopback channel | 10.12 µs/frame | **7.79 µs/frame** (−23 %) |
+
+The harness row includes the wire encode/decode round trip, so it sees
+the buffer copies and the per-frame `setsockopt` that the in-process
+dispatch does not. The gain is deliberately modest — the delivery path was
+already tuned in v0.3.4, and what was left was lock traffic and buffer
+copies, not algorithms. The security fix is the substance of this release.
+
 ## [0.3.5] — 2026-11-14
 
 MLACP v0.3.5 is a security and robustness release. It closes a

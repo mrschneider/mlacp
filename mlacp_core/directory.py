@@ -65,13 +65,18 @@ class HierarchicalDirectory:
 
     # -- resolution with zone-widening ------------------------------------------
     def resolve(self, urn: str) -> Entry:
+        # Fast path: the wire URN IS the canonical string (validated at
+        # parse_frame / Envelope.from_value).  A direct dict hit skips
+        # the Address.parse → to_urn round-trip entirely.
+        #
+        # The hit path takes NO LOCK: a dict.get is atomic under the
+        # GIL, and a read cannot observe a torn dict — the lock only
+        # matters for the slow path (the zone-widening fallback, which
+        # walks the index).
+        entry = self._entries.get(urn)
+        if entry is not None:
+            return entry
         with self._lock:
-            # Fast path: the wire URN IS the canonical string (validated at
-            # parse_frame / Envelope.from_value).  A direct dict hit skips
-            # the Address.parse → to_urn round-trip entirely.
-            entry = self._entries.get(urn)
-            if entry is not None:
-                return entry
             # Zone-widening: any zone of the same org, same node+service
             addr = Address.parse(urn)
             candidates = self._by_service.get((addr.org, addr.node, addr.service), {})
@@ -95,6 +100,35 @@ class HierarchicalDirectory:
                 )
             self._counts[org] = n
             return n
+
+    def charge_and_resolve(self, org: str, urn: str) -> Entry:
+        """Charge the organization AND resolve the addressee under ONE lock.
+
+        The hot path needs both: the per-message quota (Akademset
+        accounting) and the mandatory registration check (the OGAS rule).
+        Two separate calls took the lock twice per frame — every message
+        serialized behind two acquisitions. The quota is charged FIRST, so
+        the refusal order (quota before registration) is unchanged.
+
+        The lock is taken EXPLICITLY (not through the ``@locked``
+        decorator): the decorator repacks the arguments into ``*args,
+        **kwargs`` on every call, which cost more than the lock it saved.
+        """
+        with self._lock:
+            n = self._counts.get(org, 0) + 1
+            if n > self.org_quota:
+                raise QuotaExceeded(
+                    f"organization '{org}' exceeded its quota of {self.org_quota}"
+                )
+            self._counts[org] = n
+            entry = self._entries.get(urn)
+            if entry is not None:
+                return entry
+            addr = Address.parse(urn)
+            candidates = self._by_service.get((addr.org, addr.node, addr.service), {})
+            if candidates:
+                return next(iter(candidates.values()))
+            raise UnknownService(urn)
 
     @locked
     def usage(self, org: str) -> int:

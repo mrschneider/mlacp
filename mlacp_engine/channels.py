@@ -70,14 +70,19 @@ class TcpChannel:
         self.sock = sock
         self.eof = False
         self._send_lock = threading.Lock()
+        self._timeout = None
 
     def send(self, data: bytes) -> None:
         with self._send_lock:
             self.sock.sendall(data)
 
     def recv(self, timeout: float | None = None) -> bytes | None:
-        if timeout is not None:
+        # PERF: the timeout is applied only when it CHANGES. The serve
+        # loop reads with a constant timeout, so the old code paid a
+        # setsockopt syscall on every single frame.
+        if timeout is not None and timeout != self._timeout:
             self.sock.settimeout(timeout)
+            self._timeout = timeout
         try:
             data = self.sock.recv(65536)
         except (socket.timeout, TimeoutError):
@@ -104,14 +109,17 @@ class UnixChannel:
         self.sock = sock
         self.eof = False
         self._send_lock = threading.Lock()
+        self._timeout = None
 
     def send(self, data: bytes) -> None:
         with self._send_lock:
             self.sock.sendall(data)
 
     def recv(self, timeout: float | None = None) -> bytes | None:
-        if timeout is not None:
+        # PERF: only re-apply the timeout when it changes (see TcpChannel)
+        if timeout is not None and timeout != self._timeout:
             self.sock.settimeout(timeout)
+            self._timeout = timeout
         try:
             data = self.sock.recv(65536)
         except (socket.timeout, TimeoutError):

@@ -187,6 +187,38 @@ The pure-Python VKO path (same handshake under `MLACP_PURE=1`) drops from
 ≈79 ms to ≈50 ms per call. The 2 KB encrypt/decrypt and loopback-envelope
 rows are unchanged.
 
+### v0.3.6 — one lock per frame, and a serializer that stops wasting bytes
+
+The v0.3.6 round removed per-frame work from the delivery path:
+
+| Change | Effect |
+|---|---|
+| The per-org quota charge and the registration check now share ONE directory lock (`charge_and_resolve`) instead of two acquisitions | one lock instead of two per frame |
+| `directory.resolve` takes no lock on the hit path — a `dict.get` is atomic under the GIL, and a read cannot observe a torn dict | no lock on the hot path |
+| The socket read timeout is applied only when it changes, and the remaining time is quantized to 5 ms | one `setsockopt` instead of one per frame |
+| The JSON line buffer is consumed in place on the channel (a `bytearray`) | three buffer copies per frame removed |
+| The stdlib JSON fallback writes compact separators (`","`/`":"`) | ~10–15 % fewer bytes on the wire, same JSON value |
+
+The frame path, measured with 100,000 envelopes through `handle_frame`
+(best of 6 alternating runs, one machine):
+
+| Workload | v0.3.5 | v0.3.6 |
+|---|---:|---:|
+| Local envelope delivery (100k frames, in-process dispatch) | 3.06 µs/frame (avg) | 2.95 µs/frame (avg) |
+| Repository harness — 2,000 envelopes over a loopback channel | 10.12 µs/frame | **7.79 µs/frame** (−23 %) |
+
+The harness row is the honest end-to-end number: it includes the wire
+encode/decode round trip, so it sees the buffer copies and the per-frame
+`setsockopt` that the in-process dispatch does not. The gain is
+deliberately modest — the delivery path was already tuned in v0.3.4, and
+what was left was lock traffic and buffer copies, not algorithms.
+
+`orjson` is what the hot path was measured with — it is 5–15× faster than
+the stdlib serializer. It is now declared as an extra
+(`pip install mlacp[speed]`) and the CI runs the whole suite and the
+cross-language E2E **twice**: once with `orjson`, once with it blocked, so
+the fallback can never rot.
+
 On the v0.3.3 tree the pure-Python reference (`MLACP_PURE=1`) got the same
 treatment on the two hot functions: Streebog's `l64` moved from a 64-column
 `bit_count` loop to an
@@ -221,6 +253,14 @@ Before deploying, account for these implementation properties:
 - **Link security:** traffic is plaintext until a link key is configured or a handshake establishes one. Key agreement needs a deployment-specific peer-authentication policy; re-keying is manual.
 - **Side channels:** the default table-driven crypto paths use secret-indexed memory. A table-free native Kuznyechik block primitive exists, but does not make the default secure-frame path constant-time.
 - **Delivery semantics:** acknowledgements represent custody transfer. Ambiguous failed exchanges are not automatically retried; applications should define recovery and deduplication behavior.
+
+Since v0.3.6, a peer's VKO public key is validated properly: the point
+must be on the curve **and** in the prime-order subgroup. The subgroup test
+introduced in v0.3.5 never actually ran (the scalar was reduced modulo `q`,
+so the check answered "yes" for every point); on a curve with a cofactor —
+256A, cofactor 4 — that let a peer present a small-order point and have it
+accepted as a public key. The default curve (512A, cofactor 1) is unaffected
+by the flaw and pays nothing for the fix.
 
 See [resource controls](docs/technical-reference.md#performance-and-resource-controls)
 for connection limits, deadlines, shutdown, and history retention.

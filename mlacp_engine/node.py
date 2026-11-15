@@ -156,9 +156,6 @@ class CenterNode:
         if required:
             self.authorize_or_refuse(sender_urn, required)
 
-        # layer 4: mandatory registration + per-org accounting
-        self.directory.account(sender_org)
-
         # ── local delivery fast path ──────────────────────────────────────
         # If the recipient is connected on THIS node, deliver directly.
         # This skips Address.parse(recipient), grid routing, and hop
@@ -168,7 +165,13 @@ class CenterNode:
         if chan is not None:
             recipient = Address.parse(recipient_urn)
             if recipient.node == self.urn.node:
-                self.directory.resolve(recipient_urn)
+                # PERF: the per-org charge AND the mandatory registration
+                # check under ONE lock. They were two acquisitions of the
+                # directory lock per frame (account + resolve); the refusal
+                # order (quota before registration) is unchanged.
+                self.directory.charge_and_resolve(sender_org, recipient_urn)
+            else:
+                self.directory.account(sender_org)
             out = {"kind": "envelope", "v": "1.0", "sender": sender_urn,
                    "recipient": recipient_urn, "seq": seq, "ttl": ttl,
                    "body": body}
@@ -190,6 +193,9 @@ class CenterNode:
             return None
 
         # ── remote / custody path ─────────────────────────────────────────
+        # layer 4: per-org accounting (the quota is charged on EVERY
+        # frame, local or remote)
+        self.directory.account(sender_org)
         recipient = Address.parse(recipient_urn)
 
         # layer 4: mandatory registration — an unregistered LOCAL addressee is
@@ -457,30 +463,58 @@ class CenterNode:
 
 # -- channel plumbing -----------------------------------------------------------
 
+# The socket read timeout is quantized (rounded UP) so that consecutive
+# reads on the same connection ask for the SAME timeout and the channel
+# applies it once instead of once per frame.
+_RECV_QUANTUM = 0.005
+
+
+def _quantize_timeout(remaining: float) -> float:
+    steps = remaining / _RECV_QUANTUM
+    return (int(steps) + 1) * _RECV_QUANTUM
+
 def _chan_send(chan, wire_frame: dict) -> None:
     data = dumps(wire_frame) + b"\n"
     chan.send(data)
 
 
 def _recv_frame(chan, timeout: float | None = None) -> dict | None:
-    """Read one JSON-line frame from a channel (buffers across recv calls)."""
-    buf = bytearray(getattr(chan, "_mlacp_buf", b""))
+    """Read one JSON-line frame from a channel (buffers across recv calls).
+
+    PERF: the buffer lives on the channel as a bytearray and is consumed
+    IN PLACE. The old path copied it twice per frame (a fresh bytearray
+    from the stored bytes, then a bytes copy of the remainder) — three
+    copies of every frame's bytes for nothing. One ``find`` locates the
+    terminator (a C scan) instead of a Python-level ``in`` test per read.
+    """
+    buf = getattr(chan, "_mlacp_buf", None)
+    if buf is None:
+        buf = bytearray()
     deadline = None if timeout is None else time.monotonic() + timeout
-    while b"\n" not in buf:
+    while True:
+        idx = buf.find(b"\n")
+        if idx >= 0:
+            line = bytes(buf[:idx])
+            del buf[:idx + 1]
+            chan._mlacp_buf = buf
+            return loads(line)
         remaining = None if deadline is None else max(0, deadline - time.monotonic())
         if remaining == 0:
-            chan._mlacp_buf = bytes(buf)
+            chan._mlacp_buf = buf
             return None
-        chunk = chan.recv(remaining)
+        # The socket timeout is re-applied per read, and the remaining
+        # time shrinks on every call — so it is QUANTIZED (rounded UP to
+        # 5 ms). The channel then applies the SAME timeout to the socket
+        # over and over (one setsockopt, not one per frame), and the total
+        # read deadline can exceed the requested one by at most 5 ms.
+        chunk = chan.recv(None if remaining is None
+                         else _quantize_timeout(remaining))
         if chunk is None:
-            chan._mlacp_buf = bytes(buf)
+            chan._mlacp_buf = buf
             return None
         buf.extend(chunk)
         if len(buf) > 4 * 1024 * 1024:
             raise ValueError("MLACP JSON frame exceeds 4 MiB")
-    line, _, rest = buf.partition(b"\n")
-    chan._mlacp_buf = bytes(rest)
-    return loads(line)
 
 
 def serve(node: CenterNode, listener, run_flag: threading.Event, *,

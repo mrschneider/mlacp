@@ -172,14 +172,21 @@ class Curve:
         self._pt_tables[P] = tab
         return tab
 
-    def scalar_mult(self, k: int, P: tuple | None = None) -> tuple | None:
+    def scalar_mult(self, k: int, P: tuple | None = None, *,
+                    reduce: bool = True) -> tuple | None:
         """8-bit windowed double-and-add (Jacobian) with a per-point window
         table. P defaults to the generator. The whole scalar mult uses ONE
         modular inverse (the final Jacobian→affine); the old path converted
         to affine on every bit/window, i.e. ~512 inverses for a 512-bit
         scalar. P at infinity (None) is returned as None; k is reduced mod
-        q (the public-key subgroup order)."""
-        k %= self.q
+        q (the public-key subgroup order).
+
+        ``reduce=False`` keeps the scalar EXACTLY as given. The subgroup
+        check needs the FULL q — reducing it would turn q·P into 0·P and
+        answer "point at infinity" for EVERY point (which made the
+        small-subgroup validation a tautology)."""
+        if reduce:
+            k %= self.q
         if P is None:
             P = self.g
         if k == 0:
@@ -212,13 +219,27 @@ class Curve:
         in the prime-order subgroup (q·P = O). Critical for curves with
         cofactor > 1 (e.g. 256A, cofactor 4) where an on-curve point can
         still lie in a small-order coset — a small-subgroup attack vector.
-        Returns True only when P is a valid public key for VKO."""
+        Returns True only when P is a valid public key for VKO.
+
+        The subgroup test uses the FULL q (``reduce=False``). The reduced
+        path would answer "point at infinity" for EVERY point (q mod q is
+        0), which made the check a tautology: a small-order point was
+        accepted as a peer public key, and the KEK derived from it is
+        attacker-predictable.
+
+        On a cofactor-1 curve (512A: m == q, the group order IS the prime
+        order) every on-curve point is in the prime-order subgroup, so
+        the subgroup test is mathematically redundant — and it is SKIPPED
+        (it would cost a full scalar multiplication for no information)."""
         if P is None:
             return False  # point at infinity is not a valid public key
         if not self.on_curve(P):
             return False
-        # small-subgroup check: q·P must be the point at infinity
-        return self.scalar_mult(self.q, P) is None
+        if self.m == self.q:
+            return True  # cofactor 1: the group order is the prime order
+        # cofactor > 1: the small-order cosets must be refused. q·P must
+        # be the point at infinity — with the scalar NOT reduced.
+        return self.scalar_mult(self.q, P, reduce=False) is None
 
 
 def _curve_512a() -> Curve:

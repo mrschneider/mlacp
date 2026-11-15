@@ -31,11 +31,15 @@ try:
 except ImportError:
     import json as _slow
 
+    # COMPACT separators: the stdlib default writes ", " and ": " between
+    # items — every frame carried the padding over the wire and the peer
+    # parsed it back. The compact form is the same JSON (any parser
+    # accepts it) with ~10-15 % fewer bytes on the wire.
     def dumps(obj) -> bytes:
-        return _slow.dumps(obj).encode()
+        return _slow.dumps(obj, separators=(",", ":")).encode()
 
     def dumps_sorted(obj) -> bytes:
-        return _slow.dumps(obj, sort_keys=True).encode()
+        return _slow.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
     def loads(data) -> object:
         return _slow.loads(data)
