@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 pub mod ct;
+pub mod ec;
 mod sbox_anf;
 mod streebog;
 mod streebog_tables;

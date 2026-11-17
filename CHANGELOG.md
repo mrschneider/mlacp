@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.3.7] — 2026-11-17
+
+MLACP v0.3.7 repairs the native GOST elliptic-curve field arithmetic
+(`native/mlacp-gost/src/ec.rs`) and the 512A curve order in the
+pure-Python reference, and promotes the native scalar mult from
+"documented WIP" to a fully cross-verified implementation. The shipped
+wheel is unchanged — the pure-Python path remains the active backend and
+`MLACP_PURE=1` still forces it.
+
+### Fixed
+
+- **`submod_w` in `native/mlacp-gost/src/ec.rs` returned `a - b + p + 2R`
+  (i.e. the correct result plus the Montgomery form of 2) on every
+  wrapped subtraction.** The borrow case produced `r = a - b + 2^(64w)`;
+  since `2^(64w) = p + R`, the field result is `a - b + p = r - R`, but
+  the code **added** `R`. Any `a - b` with `a < b` was off by exactly 2
+  in affine coordinates. This silently corrupted the X coordinate of the
+  Jacobian doubling (`X3 = M² - 2S` wraps whenever `M² < 2S`), so
+  `2G` came out as `(x + 2, y)` — on the curve, so `point_on_curve`
+  and the `q·G = O` check both passed, and only a cross-implementation
+  comparison against an independent double-and-add exposed it. The
+  borrow branch now **subtracts** `R`.
+- **The 512A order `q` in `mlacp_core/gost_ec.py` carried one extra
+  leading `0x00FF` byte (73 bytes / 576 bits)** instead of the 72-byte
+  (512-bit) prime from RFC 7836 Appendix A.1. That made `q·G ≠ O` and
+  broke the subgroup self-check the constant feeds. The constant is now
+  the documented 512-bit prime, with an `assert q.bit_length() == 512`
+  guard.
+
+### Added
+
+- **`native/mlacp-gost/src/ec.rs` is now `pub` and cross-verified:**
+  `Fp` (512/256-bit Montgomery field, CIOS reduction with the
+  full-512-bit-prime top-carry correction), Jacobian double / mixed-add /
+  general-add, and an 8-bit windowed scalar mult with a bounded
+  per-point table cache. New regression tests: RFC 7836 A.1 key-3
+  vector, `2G`/`3G` against independently computed affine values, and
+  `11G` (two non-trivial windows). The module also passes 200-iteration
+  full-range random field tests and a Python oracle over 30,000
+  reductions in `[0, 2^1024)`.
+- **`native/mlacp-gost/examples/ec_check.rs`** — CLI cross-check
+  (reads `p a b k x y` as little-endian hex lines, prints the affine
+  result), used to validate Rust against the Python reference.
+- **`Cargo.toml`** now builds an `rlib` alongside the `cdylib` so the
+  field/point code is unit-testable without a Python interpreter.
+
+### Verified
+
+- Rust: 14/14 `cargo test --release` (was 11 before this release).
+- Cross-language: Rust `scalar_mult` matches Python `Curve.scalar_mult`
+  on `q·G = O` and 50 random 512-bit scalars (exact point equality);
+  the RFC 7836 A.1 key-3 vector matches an independent Python
+  naive double-and-add.
+- Python: 118/118 tests pass; `q·G = O` holds on the corrected 512A.
+- `docs/benchmarks.md` VKO analysis updated: the native path is no
+  longer "documented WIP" — the reduction is fixed and cross-verified,
+  and it is the remaining step to wire `ec.rs` into the wheel.
+
 ## [0.3.6] — 2026-11-15
 
 MLACP v0.3.6 is a correctness-and-throughput release. It repairs the

@@ -187,6 +187,26 @@ The pure-Python VKO path (same handshake under `MLACP_PURE=1`) drops from
 ≈79 ms to ≈50 ms per call. The 2 KB encrypt/decrypt and loopback-envelope
 rows are unchanged.
 
+### v0.3.7 — the native 512-bit field arithmetic is now proven correct
+
+The v0.3.7 round repairs the GOST 512 curve math in two places. In
+`native/mlacp-gost/src/ec.rs` the modular subtraction `a - b` (borrow
+case) computed `a - b + p + 2R` instead of `a - b + p` — off by the
+Montgomery form of 2 — so a Jacobian doubling whose `M² < 2S` produced
+`2G = (x + 2, y)`: a point **on the curve**, which is why every
+in-crate check passed and only a cross-implementation comparison
+against an independent double-and-add exposed it. In
+`mlacp_core/gost_ec.py` the 512A order `q` carried one extra leading
+`0x00FF` byte (576 bits), which made `q·G ≠ O`.
+
+With both fixed, `ec.rs` (now `pub`) is cross-verified: the RFC 7836
+A.1 key-3 vector, `2G`/`3G`/`11G` against independently computed
+affine values, 200-iteration full-range field tests, a 30,000-sample
+Python reduction oracle, and 50 random 512-bit scalars matching the
+pure-Python `Curve.scalar_mult` point-for-point (plus `q·G = O`).
+Rust: 14/14 tests. Python: 118/118. The pure-Python path remains the
+active backend — wiring `ec.rs` into the wheel is the next step.
+
 ### v0.3.6 — one lock per frame, and a serializer that stops wasting bytes
 
 The v0.3.6 round removed per-frame work from the delivery path:

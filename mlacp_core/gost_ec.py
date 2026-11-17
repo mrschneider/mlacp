@@ -243,7 +243,12 @@ class Curve:
 
 
 def _curve_512a() -> Curve:
-    """id-tc26-gost-3410-12-512-paramSetA (RFC 7836 Appendix A.1)."""
+    """id-tc26-gost-3410-12-512-paramSetA (RFC 7836 Appendix A.1).
+
+    The order is the 512-bit prime 2^512 - 2^205 - 2^164 - 2^101 - 2^85 -
+    2^52 - 2^43 - 2^25 - 2^12 - 2^9 - 1 (RFC 7836 A.1). A previous version
+    of this constant had ONE extra leading 0x00FF byte (73 bytes / 576
+    bits); that made q·G != O, which the self-check below now enforces."""
     p = int.from_bytes(bytes.fromhex("00" + "FF" * 62 + "FDC7"), "big")
     a = int.from_bytes(bytes.fromhex("00" + "FF" * 62 + "FDC4"), "big")
     b = int.from_bytes(bytes.fromhex(
@@ -251,8 +256,9 @@ def _curve_512a() -> Curve:
         "65EE3CB090F30D27614CB4574010DA90DD862EF9D4EBEE4761503190785A71C7"
         "60"), "big")
     m = q = int.from_bytes(bytes.fromhex(
-        "00" + "FF" * 40 + "27E69532F48D89116FF22B8D4E0560609B4B38ABFAD2B8"
+        "00" + "FF" * 32 + "27E69532F48D89116FF22B8D4E0560609B4B38ABFAD2B8"
         "5DCACDB1411F10B275"), "big")
+    assert q.bit_length() == 512, "512A order must be 512 bits (RFC 7836 A.1)"
     gx = 3
     gy = int.from_bytes(bytes.fromhex(
         "7503CFE87A836AE3A61B8816E25450E6CE5E1C93ACF1ABC1778064FDCBEFA921"

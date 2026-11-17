@@ -90,3 +90,41 @@ the JSON round trip and the channel, not by the dispatch. The VKO
 agreement row (≈35 ms per two-party exchange) was unchanged by this round
 — it is dominated by the pure-Python elliptic-curve arithmetic, which is
 the obvious next target and is not addressed here.
+
+## VKO analysis (follow-up)
+
+Profiling the VKO agreement (the ≈35 ms two-party exchange) shows the cost
+is almost entirely the elliptic-curve arithmetic in pure Python:
+
+| Component | Measured |
+|---|---:|
+| Two-party 512A VKO handshake | ~37 ms |
+| One 512-bit scalar mult (pure Python, 8-bit window) | ~11 ms |
+| A single 512-bit `x·x % p` (Python big-int) | ~0.6 µs |
+| `_jdouble` body (the profile's dominant frame) | ~11 µs, ~69% of a mult |
+
+A handshake does **four** scalar mults (two parties × {own private·G,
+peer-public·ephemeral}), so ≈4 × 11 ms ≈ 37 ms — the number checks out.
+Window size is NOT the lever: an 8-bit→4-bit window saves only ~1.2× and
+the `a = p−3` (Curve 512A) specialization of the doubling formula saves
+~4%, because the floor is Python's 512-bit modular multiply, not the
+addition count. The only order-of-magnitude win is moving the field
+arithmetic out of the interpreter.
+
+**Status:** the natural target — a native Rust scalar mult in
+`native/mlacp-gost` (the project already ships a Rust backend) — is
+implemented and now fully verified (`src/ec.rs`, a self-contained
+512/256-bit Montgomery field + Jacobian windowed double-and-add, no new
+dependencies, ~3–4× faster than `num_bigint`'s u32-digit division). The
+earlier runtime fault was a genuine reduction bug, now fixed: the GOST
+512 prime `p` is a full 512-bit prime with `2p > 2^512`, so the CIOS
+reduction can return a value up to `2p < 2^513` — one bit above the
+2w-limb accumulator — and the discarded top carry had to be added back
+as `2^512 − p`, followed by two conditional subtractions. The module
+passes 11 Rust tests (including a 200-iteration full-range random field
+test and `inv_check`) and matches a Python oracle on 30,000 random
+reductions in `[0, 2^1024)`. It is **not yet wired into the wheel**:
+the pure-Python reference (`mlacp_core/gost_ec.py`) remains the active,
+fully-tested path (31 EC/GOST tests + RFC 7836 vectors pass);
+`MLACP_PURE=1` still forces it. `ec.rs` is exported (`pub mod ec`) and
+unit-tested, so the shipped wheel is unchanged.
