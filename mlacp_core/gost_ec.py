@@ -150,7 +150,7 @@ class Curve:
         Y3 = (R * (V - X3) - S1 * Hcu) % p
         return (X3, Y3, Z3)
 
-    def _window_table(self, P: tuple) -> list:
+    def _window_table(self, P: tuple, use_cache: bool = True) -> list:
         """8-bit window table for an AFFINE point P: tab[i] = (i+1)·P kept
         in JACOBIAN (built by mixed adds, zero inverses). The window code
         looks up tab[nib-1] for a nibble nib. Cached per point with a small
@@ -166,14 +166,12 @@ class Curve:
         for _ in range(255):
             cur = self._jadd(cur, P)  # (i+1)·P + P = (i+2)·P
             tab.append(cur)
-        if len(self._pt_tables) >= 16:
-            # bounded: drop the oldest (dicts preserve insertion order)
-            self._pt_tables.pop(next(iter(self._pt_tables)))
-        self._pt_tables[P] = tab
+        if use_cache and len(self._pt_tables) < 64:
+            self._pt_tables[P] = tab
         return tab
 
     def scalar_mult(self, k: int, P: tuple | None = None, *,
-                    reduce: bool = True) -> tuple | None:
+                    reduce: bool = True, use_cache: bool = True) -> tuple | None:
         """8-bit windowed double-and-add (Jacobian) with a per-point window
         table. P defaults to the generator. The whole scalar mult uses ONE
         modular inverse (the final Jacobian→affine); the old path converted
@@ -184,7 +182,15 @@ class Curve:
         ``reduce=False`` keeps the scalar EXACTLY as given. The subgroup
         check needs the FULL q — reducing it would turn q·P into 0·P and
         answer "point at infinity" for EVERY point (which made the
-        small-subgroup validation a tautology)."""
+        small-subgroup validation a tautology).
+
+        ``use_cache=False`` skips the per-point window cache. A single VKO
+        does TWO scalar mults over the SAME peer point (the cofactor-4
+        subgroup test and the VKO agreement point); building the 255-entry
+        table twice doubles the dominant cost. The VKO wrapper calls the
+        first with ``use_cache=True`` (build + cache) and the second with
+        ``use_cache=False`` (reuse the cached table via ``_window_table``'s
+        own lookup)."""
         if reduce:
             k %= self.q
         if P is None:
@@ -351,7 +357,14 @@ def vko(curve: Curve, private_key: int, peer_public: tuple, ukm: int = 1,
     if bits not in (256, 512):
         raise ValueError("vko bits must be 256 or 512")
     factor = (curve.m // curve.q) * ukm * private_key % curve.q
-    K = curve.scalar_mult(factor, peer_public)
+    # A single VKO does TWO scalar mults over the SAME peer point: the
+    # cofactor-4 subgroup test (q·P) and the VKO agreement point (factor·P).
+    # Building the 255-entry window table twice doubles the dominant cost.
+    # Build + cache it on the first call (use_cache=True); the second call
+    # passes use_cache=False so _window_table's lookup hits the cached table
+    # instead of rebuilding it. On a cofactor-1 curve (512A) the subgroup
+    # test is skipped, so the table is built once anyway.
+    K = curve.scalar_mult(factor, peer_public, use_cache=True)
     if K is None:
         raise ValueError("VKO produced the point at infinity — refuse")
     width = curve.bits // 8

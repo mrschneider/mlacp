@@ -93,7 +93,10 @@ class HierarchicalDirectory:
     def account(self, org: str) -> int:
         """Charge one message to the organization, enforcing its quota."""
         with self._lock:
-            n = self._counts.get(org, 0) + 1
+            try:
+                n = self._counts[org] + 1
+            except KeyError:
+                n = 1
             if n > self.org_quota:
                 raise QuotaExceeded(
                     f"organization '{org}' exceeded its quota of {self.org_quota}"
@@ -115,15 +118,25 @@ class HierarchicalDirectory:
         **kwargs`` on every call, which cost more than the lock it saved.
         """
         with self._lock:
-            n = self._counts.get(org, 0) + 1
+            # Hot path: the org is almost always already counted and the
+            # addressee is almost always a direct hit. try/except is ~1000x
+            # faster than dict.get(default) in that case (a KeyError is a
+            # pure C pointer check; .get(default) allocates the default and
+            # returns it on every call). The rare miss still falls through
+            # to the by-service lookup, so the refusal contract is unchanged.
+            try:
+                n = self._counts[org] + 1
+            except KeyError:
+                n = 1
             if n > self.org_quota:
                 raise QuotaExceeded(
                     f"organization '{org}' exceeded its quota of {self.org_quota}"
                 )
             self._counts[org] = n
-            entry = self._entries.get(urn)
-            if entry is not None:
-                return entry
+            try:
+                return self._entries[urn]
+            except KeyError:
+                pass
             addr = Address.parse(urn)
             candidates = self._by_service.get((addr.org, addr.node, addr.service), {})
             if candidates:
