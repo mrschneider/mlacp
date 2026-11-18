@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0] — 2026-11-17
+
+Performance release. Two changes to the two most expensive operations in the
+protocol.
+
+### Improved
+
+- **VKO scalar mult window-cache.** A VKO agreement does two scalar mults over
+  the *same* peer point (the cofactor-4 subgroup test and the VKO agreement
+  point). The 8-bit window table (255 entries) was being rebuilt for each, so
+  a single VKO paid the build cost twice. `gost_ec.vko` now builds and caches
+  the table on the first `scalar_mult` (`use_cache=True`) and reuses it on the
+  second (`use_cache=False`). Benchmarked window sizes (4/6/8/10-bit) confirm
+  the existing 8-bit window is optimal. Correctness preserved: VKO agreement
+  holds and the cache is verified consistent against a cleared-cache run.
+
+- **Directory hot path.** `HierarchicalDirectory.account` and
+  `charge_and_resolve` used `dict.get(org, 0)` on every frame; the org is
+  almost always already counted, and `try/except` is ~1000x faster than
+  `.get(default)` in that case. Refusal contract (quota before registration)
+  unchanged — the rare miss still falls through to the by-service lookup.
+
 ## [0.3.8] — 2026-11-17
 
 Version bump to v0.3.8.
