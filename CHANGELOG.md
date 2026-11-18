@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.3.8] — 2026-11-17
+
+Version bump to v0.3.8.
+
 ## [0.3.7] — 2026-11-17
 
 MLACP v0.3.7 repairs the native GOST elliptic-curve field arithmetic
